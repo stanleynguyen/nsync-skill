@@ -1,0 +1,11 @@
+{
+  "name": "nsync",
+  "version": "0.1.0",
+  "description": "Git-style sync between local markdown files and a Notion parent page tree. Uses Claude's built-in Notion connector.",
+  "author": {
+    "name": "pixel8labs",
+    "email": "dev@pixel8labs.com"
+  },
+  "license": "MIT",
+  "keywords": ["notion", "sync", "markdown", "git"]
+}

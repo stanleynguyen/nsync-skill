@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "nsync",
+  "description": "Git-style sync between local markdown files and a Notion parent page tree.",
+  "owner": {
+    "name": "stanleynguyen",
+    "email": "stanley@pixel8labs.com"
+  },
+  "plugins": [
+    {
+      "name": "nsync",
+      "description": "Git-style sync between local markdown files and a Notion parent page tree.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
