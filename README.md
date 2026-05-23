@@ -175,20 +175,11 @@ File an issue at https://github.com/stanleynguyen/nsync-skill/issues. Minimal re
 
 ### Submit a PR
 
-Open at https://github.com/stanleynguyen/nsync-skill/pulls. One concern per PR, please. For non-trivial design changes, open an issue first and reference any relevant section in the plan file at `/Users/stanley/.claude/plans/i-want-to-create-cosmic-frog.md` (sections A–J are the v1 design, K covers `/nsync:diff` arguments, L is post-dry-run fixes, M is the connector migration, N is this README rewrite).
-
-### Pre-PR checks
-
-Before requesting review:
-
-```bash
-claude plugin validate .
-grep -rn "NOTION_TOKEN\|@notionhq\|mcp__notion__" --include="*.md" --include="*.json" .  # should match zero
-```
+Open at https://github.com/stanleynguyen/nsync-skill/pulls. One concern per PR, please. For non-trivial design changes, open an issue first.
 
 ### End-to-end checklist
 
-Run these against a throwaway Notion parent page before requesting review. The first two dry-runs of this plugin caught real design bugs (logged in plan §L). This checklist exists so contributors can do the same.
+Run these against a throwaway Notion parent page before requesting review.
 
 Create a Notion parent page "nsync-test" with three sub-pages:
 

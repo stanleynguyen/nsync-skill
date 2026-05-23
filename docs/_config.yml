@@ -1,0 +1,11 @@
+title: Claude plugin to sync Notion workspaces
+description: Claude plugin that treats your Notion workspace like a git repository - pull, edit locally, diff, commit.
+url: https://stanleynguyen.me
+baseurl: /nsync-skill
+theme: jekyll-theme-cayman
+show_downloads: false
+github:
+  repository_url: https://github.com/stanleynguyen/nsync-skill
+  repository_nwo: stanleynguyen/nsync-skill
+  zip_url: https://github.com/stanleynguyen/nsync-skill/archive/refs/heads/master.zip
+  tar_url: https://github.com/stanleynguyen/nsync-skill/archive/refs/heads/master.tar.gz
