@@ -39,16 +39,21 @@ Once preflight passes:
 4. For each discovered page (depth-first):
    - Compute the local path per `references/path-mapping.md` (slug + collision suffix + `index.md` for pages with children).
    - `fetch` the page body. Apply the markdown normalization pipeline; record rich-block presence in `rich_blocks` (type + coarse anchor + summary) per `references/manifest-schema.md`.
-   - Write the local `.md` file with the markdown-only body.
+   - **If the page has children** (`has_children: true`): walk the fetched body line by line. For each whole-line `<page url url="<href>"[ icon="..."]>Title</page>` tag, substitute the line with a child-link line per `references/path-mapping.md` → "Child-link lines" → "Format". The substitution requires knowing the target's local path, so process pages depth-first (children before parents) so the manifest already contains the relevant PageRecords. For `<page url>` tags whose UUID is NOT yet in the manifest (race/ordering edge case — shouldn't happen with depth-first), render with the `external` flag and the full Notion URL; the line will be promoted to a relative link on the next `/nsync:pull`.
+   - Write the local `.md` file with the resulting markdown.
    - Write `.nsync/snapshots/<page_id>.md` with the same content.
-   - Add a PageRecord with computed `local_hash`, `remote_hash`, `last_synced_at` (now), `has_children`, `local_ignored: false`. (No `last_seen_remote_modified` field in v1 — hashes drive classification.)
-5. Persist `manifest.json` (sorted-key, two-space-indented).
+   - Add a PageRecord with computed `local_hash`, `remote_hash`, `last_synced_at` (now), `has_children`, `local_ignored: false`. Both hashes are computed per the pipeline in `references/manifest-schema.md`, which strips child-link lines and `<page url>` tags — so they're identical regardless of whether the file contains rendered child-link lines or none. (No `last_seen_remote_modified` field in v1 — hashes drive classification.)
+5. **Mirror the parent body if non-empty.** `fetch` the parent page itself. Apply the markdown normalization pipeline (rich-block tags + image-block lines stripped — but NOT child-link lines; those are rendered, not removed). Decide per `references/path-mapping.md` → "Non-empty parent body":
+   - **Empty** (zero-length after strip, or only a single `# <Title>` line): skip — no `index.md`, no root PageRecord. Note this in the output summary as "Parent body empty — no root index.md created".
+   - **Non-empty**: substitute each whole-line `<page url>` tag in the parent body with a child-link line (relative path from sync root; manifest has been populated by step 4). Write the result to `<sync-root>/index.md`. Write `.nsync/snapshots/<parent_page_id>.md` with the same content. Add the **root PageRecord** keyed by `config.parent.page_id` with `path: "index.md"`, `parent_page_id: null`, `has_children: true` (assuming the search in step 3 found any sub-page; else `false`), `local_hash` and `remote_hash` computed over the normalized content per the pipeline, `last_synced_at` (now), `local_ignored: false`, and any detected `rich_blocks`.
+6. Persist `manifest.json` (sorted-key, two-space-indented).
 
 ## Output
 
 Print a short summary:
 - Parent page title and URL
-- Count of pages mirrored
+- Whether the root `index.md` was created (and why not, if skipped — empty parent body)
+- Count of pages mirrored (excluding the root entry to avoid double counting; or call them out separately)
 - Count of rich blocks detected (preserved, not synced) — grouped by type
 - Any pages that failed to fetch, with the underlying error per page
 

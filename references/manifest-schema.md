@@ -81,6 +81,20 @@ Field semantics:
 
 There is intentionally no `last_seen_remote_modified` field in v1. State classification is driven purely by hash comparison — see `conflict-protocol.md` for the three-state table. v2 may reintroduce a `last_seen_remote_modified` field as an opt-in skip-fetch optimization (cache only; never authoritative for classification).
 
+### Root PageRecord (the sync-root entry)
+
+When the Notion parent page has a non-empty body (per `path-mapping.md` → "Non-empty parent body"), its body is mirrored at `<sync-root>/index.md` and tracked as a normal PageRecord with these specifics:
+
+- **UUID key** equals `config.parent.page_id` — this is the marker that identifies the root entry.
+- **`path`** = `"index.md"`.
+- **`parent_page_id`** = `null` — sentinel meaning "this is the sync root; no nsync-visible parent". Every other PageRecord has a non-null `parent_page_id`.
+- **`has_children`** mirrors whether the parent has Notion sub-pages (almost always `true` in practice).
+- All other fields (`title`, `url`, hashes, `last_synced_at`, `rich_blocks`, `local_ignored`) behave identically to non-root PageRecords.
+
+The root entry is subject to the constraints in `path-mapping.md` → "Root-page constraints": no rename, no orphan/trash, not in default ignore. `/nsync:commit`'s Deleted-page flow checks `parent_page_id == null` and routes to a restricted prompt (`[R]estore local` / `[E]mpty parent body`) instead of the normal orphan/manual-trash options.
+
+If the parent body becomes empty over time (user clears it in Notion), the root PageRecord remains tracked; the next `/nsync:pull` overwrites `index.md` with the empty/title-only content as a normal Auto-mergeable remote-only update.
+
 ## `TrashEntry`
 
 ```json
@@ -114,6 +128,18 @@ Entries are kept indefinitely. Volume stays low because trash events are rare.
     "title": "Docs"
   },
   "pages": {
+    "fb1d8c3a-5e21-4f70-8a23-9c4b6d8e1f02": {
+      "path": "index.md",
+      "title": "Docs",
+      "parent_page_id": null,
+      "url": "https://www.notion.so/workspace/Docs-fb1d8c3a5e214f708a239c4b6d8e1f02",
+      "last_synced_at": "2026-05-23T10:14:32Z",
+      "local_hash": "sha256:b04f...",
+      "remote_hash": "sha256:b04f...",
+      "rich_blocks": [],
+      "has_children": true,
+      "local_ignored": false
+    },
     "7c2a4d10-3b8e-4a99-9c12-1d5e7f3a8b62": {
       "path": "onboarding.md",
       "title": "Onboarding",
@@ -156,6 +182,7 @@ Apply identically to local file bytes and remote markdown bodies before SHA-256:
 3. Convert all line endings to LF.
 4. Strip trailing whitespace from every line.
 5. Ensure exactly one trailing newline (no extra blank lines at EOF).
-6. For `remote_hash` only: strip enhanced-markdown rich-block tags and their contents. See `notion-mcp-cheatsheet.md` for the full tag list.
+6. For `remote_hash` only: strip enhanced-markdown rich-block tags and their contents. See `notion-mcp-cheatsheet.md` for the full tag list. Image-block lines (markdown-syntax) are stripped here too.
+7. **Both `remote_hash` and `local_hash`**: strip every whole-line `<page url ...>...</page>` tag AND every line matching the **child-link regex** in `path-mapping.md` → "Child-link lines". This is symmetric on both sides: the `<page url>` strip catches the remote form (what Notion serializes), and the child-link strip catches the local form (what nsync renders into `index.md`). Together they make child adds, removes, renames, and reorders invisible to both hashes — so parent pages don't churn when children change.
 
 Both implementations (one for `local_hash`, one for `remote_hash`) must produce byte-identical output on byte-identical inputs. If a discrepancy is suspected during debugging, log both the canonicalized text and the hash alongside the conflict report.

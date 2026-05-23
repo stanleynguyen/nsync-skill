@@ -18,7 +18,7 @@ Input: `$ARGUMENTS` may contain `--force <path>` (repeatable). Parse them out be
 
 1. Walk upward to locate `.nsync/`. Abort if missing.
 2. Load manifest + ignore. Apply ignore matcher. Parse `--force` paths from arguments.
-3. Recompute `local_hash` for every tracked file. Run rename detection (apply confirmed renames to PageRecord paths now — these will be pushed as `notion-move-pages` calls in step 7 if the directory portion changed).
+3. Recompute `local_hash` for every tracked file. Run rename detection (apply confirmed renames to PageRecord paths now — these will be pushed as `notion-move-pages` calls in step 7 if the directory portion changed). Rename detection skips any PageRecord with `parent_page_id: null` (the root entry — its path is fixed at `index.md` and cannot be renamed in v1).
 4. For every tracked page, `fetch` to get current content. Compute fresh `remote_hash` (markdown-only, with rich-block tags + standalone image-block lines stripped per `references/notion-mcp-cheatsheet.md`).
 5. **Workspace-wide staleness check**: for every tracked page NOT in the `--force` set, verify `remote_hash == manifest.remote_hash`. If any page fails this check, abort with: "Remote has changes you haven't pulled. Run /nsync:pull first. To override specific files, pass `--force <path>` for each." When listing the offending pages, show the manifest's stored `remote_hash` prefix vs the freshly-computed one so the user sees what diverged.
 6. Compute the commit set:
@@ -32,7 +32,8 @@ Input: `$ARGUMENTS` may contain `--force <path>` (repeatable). Parse them out be
 For each Modified page:
 
 1. Read the local `.md` file and the snapshot at `.nsync/snapshots/<page_id>.md`.
-2. Diff snapshot → local to produce hunks (use `diff -u` via Bash when helpful).
+1a. **Strip child-link lines from both** before diffing. Use the recognition regex from `references/path-mapping.md` → "Child-link lines". These lines are nsync-managed: the user does not own them, Notion does not consume them, and pushing them via `update_content` would create plain markdown links that conflict with Notion's native child-page blocks. Reordering, renaming, inserting, or deleting child-link lines locally produces ZERO hunks — out of scope for v1. (A future `/nsync:mv` could push child reorders via the Notion API.)
+2. Diff snapshot → local (both with child-link lines stripped) to produce hunks (use `diff -u` via Bash when helpful).
 3. Use the already-fetched `remote_raw` (with rich-block tags) from step 4.
 4. For each hunk, construct an `{ old_str, new_str }` pair following the strict line-boundary rule in `references/notion-mcp-cheatsheet.md` ("Rich-block-safe update via `update_content`" → step 5). Briefly: `old_str` must begin and end at line boundaries within `remote_raw`, cover the entire start and end lines of the change, include at least one full unchanged line of leading and trailing context where available, and be uniquely line-bounded-matchable in `remote_raw`. A short fragment like `"Read the README."` is NEVER acceptable as `old_str` — it can substring-match inside a longer line like `"Read the README and the CONTRIBUTING guide."` and corrupt the page.
    Validation rejects the hunk (and refuses the file's commit, with an actionable message) if:
@@ -52,11 +53,20 @@ For each New `.md`:
 
 ## Deleted pages
 
-For each Deleted PageRecord, AskUserQuestion with three options:
+For each Deleted PageRecord, branch on whether it is the **root entry** (`parent_page_id == null`, key equals `config.parent.page_id`).
+
+**Non-root** Deleted PageRecord — AskUserQuestion with three options:
 
 - `[O]rphan to workspace` (default) — `notion-move-pages` with `new_parent: { type: "workspace" }`. The page survives at workspace level; the user can trash later in Notion. Record TrashEntry `trashed_by: "orphaned-to-workspace"`. Remove the PageRecord.
 - `[M]anual trash` — print the Notion URL and instruct the user to use the `···` → "Move to Trash" in Notion UI. Record TrashEntry `trashed_by: "untracked-no-remote-action"`. Remove the PageRecord.
 - `[R]estore local` — recreate the local file from `.nsync/snapshots/<page_id>.md`. No remote action; no PageRecord change.
+
+**Root** Deleted PageRecord — the parent Notion page cannot be trashed or orphaned (it is the sync target itself). AskUserQuestion with two options only:
+
+- `[R]estore local` (default) — recreate `index.md` from `.nsync/snapshots/<parent_page_id>.md`. No remote action; PageRecord unchanged.
+- `[E]mpty parent body` — call `notion-update-page` with `command: "replace_content"` and an empty body. Overwrite the snapshot with empty content. Recompute `local_hash` and `remote_hash` (both will be the hash of empty/normalized content). Keep the PageRecord; refresh `last_synced_at`. The user can later create a fresh `index.md` to repopulate the parent body.
+
+Never offer orphan or manual-trash for the root entry.
 
 ## Renamed pages
 

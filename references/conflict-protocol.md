@@ -77,6 +77,14 @@ When `[E]dit` is chosen, write the following to `.nsync/conflicts/<page_id>.scra
 
 The LOCAL and REMOTE sections are reference-only and must be discarded when finalizing. Only the contents inside the MERGED markers become the new file.
 
+## Root PageRecord special-case
+
+The root entry (PageRecord with `parent_page_id: null`, keyed by `config.parent.page_id` — see `manifest-schema.md` → "Root PageRecord") participates normally in conflict classification and resolution. The only deviation is `/nsync:commit`'s Deleted-page flow: when `index.md` is missing locally, the prompt is restricted to `[R]estore local` / `[E]mpty parent body` — never `[O]rphan` / `[M]anual trash`. See `commands/commit.md`.
+
+## Child-link line regeneration
+
+`/nsync:pull` regenerates child-link lines (see `path-mapping.md` → "Child-link lines") in every `has_children: true` page **after** the three-state classification above and **before** any user-facing conflict prompts. Regeneration rewrites the local file in place but does NOT move either hash (the lines are stripped by the normalization pipeline). It never triggers, opens, or otherwise interacts with the conflict flow — the user only sees prose-driven conflicts. Renames, additions, removals, and reorders of children are visible in the regenerated lines but invisible to hash comparison.
+
 ## Detecting conflicts that resolve themselves
 
 If `remote_hash != manifest.remote_hash` but the remote markdown is byte-identical to the local file after normalization, the "conflict" is illusory — both sides converged on the same content. Treat as Clean and silently update both hashes.

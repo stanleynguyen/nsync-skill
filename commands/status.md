@@ -14,6 +14,7 @@ Read these references first:
 
 1. Walk upward to locate `.nsync/`. Abort if missing: "Not a sync root. Run /nsync:init first."
 2. Load `.nsync/manifest.json` and `.nsync/ignore`. Compute the ignore matcher.
+2a. **Read-only root-backfill check.** If `manifest.pages` has no entry keyed by `config.parent.page_id`, `fetch` the parent page and apply the markdown normalization pipeline. If the body is non-empty per `references/path-mapping.md` → "Non-empty parent body", remember this for the output section "Pending migration". Do NOT write any files — this is status, not pull.
 3. Glob `**/*.md` under sync root, excluding `.nsync/` and ignored patterns. Scope is `.md` only — never look at other extensions.
 4. Recompute `local_hash` for every glob result. Cross-reference against PageRecords:
    - Local file exists + PageRecord exists + hashes match → Clean.
@@ -37,5 +38,7 @@ Read these references first:
 - **Remote-added** — remote pages not yet mirrored locally.
 - **Remote-trashed** — pages no longer reachable upstream.
 - **Ignored (was tracked)** — pages flagged `local_ignored: true`.
+- **Pending migration** — if step 2a flagged a missing root entry with non-empty parent body, print: `Root index.md will be created on next /nsync:pull (parent body has <N chars> of content).`
+- **Child links to update** — for each tracked PageRecord with `has_children: true`, compare the **expected** child-link line set (derived from the freshly-fetched `<page url>` tags in step 5 + manifest path lookups) against the **existing** child-link lines in the local `index.md` (matched via the recognition regex in `references/path-mapping.md` → "Child-link lines"). List any file whose expected ≠ existing, with a one-line summary like `<path>: +<n_added> / -<n_removed> / ~<n_renamed>`. Do NOT modify anything — `/nsync:pull` will reconcile.
 
 Close with a one-liner suggesting `/nsync:pull` and/or `/nsync:commit` based on findings, or "Working tree clean. All pages in sync." if every section is empty.
