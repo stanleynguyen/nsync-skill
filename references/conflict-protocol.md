@@ -85,6 +85,8 @@ The root entry (PageRecord with `parent_page_id: null`, keyed by `config.parent.
 
 `/nsync:pull` regenerates child-link lines (see `path-mapping.md` → "Child-link lines") in every `has_children: true` page **after** the three-state classification above and **before** any user-facing conflict prompts. Regeneration rewrites the local file in place but does NOT move either hash (the lines are stripped by the normalization pipeline). It never triggers, opens, or otherwise interacts with the conflict flow — the user only sees prose-driven conflicts. Renames, additions, removals, and reorders of children are visible in the regenerated lines but invisible to hash comparison.
 
+Placeholder child-link lines (the no-`page_id` form awaiting commit-time backfill, see `path-mapping.md` → "Placeholder child-link lines") are left untouched by regeneration: they are resolved only at `/nsync:commit`, never enter the conflict flow, and are likewise stripped from both hashes.
+
 ## Detecting conflicts that resolve themselves
 
 If `remote_hash != manifest.remote_hash` but the remote markdown is byte-identical to the local file after normalization, the "conflict" is illusory — both sides converged on the same content. Treat as Clean and silently update both hashes.

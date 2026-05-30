@@ -27,12 +27,14 @@ Input: `$ARGUMENTS` may contain `--force <path>` (repeatable). Parse them out be
    - **Deleted** — PageRecord exists, file missing, not `local_ignored`.
    - **Renamed** — PageRecord path changed during step 3 and directory portion differs from the old parent_page_id's location.
 
+   The **Backfill pass** (see "Backfill child-link placeholders" below) is separate from this commit set: it scans every `has_children` file for placeholder child-link lines regardless of classification, because a parent whose only edit is a placeholder hashes Clean (placeholder stripped from `local_hash`) and lands in neither New nor Modified.
+
 ## Modified pages — rich-block-safe update via `update_content`
 
 For each Modified page:
 
 1. Read the local `.md` file and the snapshot at `.nsync/snapshots/<page_id>.md`.
-1a. **Strip child-link lines from both** before diffing. Use the recognition regex from `references/path-mapping.md` → "Child-link lines". These lines are nsync-managed: the user does not own them, Notion does not consume them, and pushing them via `update_content` would create plain markdown links that conflict with Notion's native child-page blocks. Reordering, renaming, inserting, or deleting child-link lines locally produces ZERO hunks — out of scope for v1. (A future `/nsync:mv` could push child reorders via the Notion API.)
+1a. **Strip child-link lines AND placeholder child-link lines from both** before diffing. Use the recognition regex AND the placeholder regex from `references/path-mapping.md` → "Child-link lines". These lines are nsync-managed (placeholders are resolved by the Backfill pass above): the user does not own them, Notion does not consume them, and pushing them via `update_content` would create plain markdown links that conflict with Notion's native child-page blocks. Reordering, renaming, inserting, or deleting child-link lines locally produces ZERO hunks, out of scope for v1. (A future `/nsync:mv` could push child reorders via the Notion API.)
 2. Diff snapshot → local (both with child-link lines stripped) to produce hunks (use `diff -u` via Bash when helpful).
 3. Use the already-fetched `remote_raw` (with rich-block tags) from step 4.
 4. For each hunk, construct an `{ old_str, new_str }` pair following the strict line-boundary rule in `references/notion-mcp-cheatsheet.md` ("Rich-block-safe update via `update_content`" → step 5). Briefly: `old_str` must begin and end at line boundaries within `remote_raw`, cover the entire start and end lines of the change, include at least one full unchanged line of leading and trailing context where available, and be uniquely line-bounded-matchable in `remote_raw`. A short fragment like `"Read the README."` is NEVER acceptable as `old_str` — it can substring-match inside a longer line like `"Read the README and the CONTRIBUTING guide."` and corrupt the page.
@@ -45,11 +47,24 @@ For each Modified page:
 
 ## New pages
 
-For each New `.md`:
+Create New pages in **topological order**: a directory's `index.md` before any sibling/child `.md` whose parent resolves to it (a new folder's parent page must exist before its children are created, and before the Backfill pass needs its `page_id`). For each New `.md`, in that order:
 
 1. Determine the parent Notion page: look up the page whose path corresponds to the new file's containing directory (e.g., `engineering/roadmap.md` → parent = page at `engineering/index.md`). Root-level files attach to `config.json.parent.page_id`.
 2. Call `notion-create-pages` with parent + title (derived from the H1 of the file or the slugged filename) + the local markdown body.
 3. On success, add a PageRecord (UUID from the response), write the snapshot file, persist manifest.
+
+## Backfill child-link placeholders
+
+After the New-page batch completes (every New page now has a `page_id`) and **before** the Modified-page diff, resolve placeholder child-link lines into managed lines. This runs after confirmed renames (step 3), so path resolution sees post-rename paths.
+
+Scan **every `has_children` local file** for placeholder lines (the placeholder regex in `references/path-mapping.md` → "Child-link lines"), regardless of whether the file is in the commit set: a parent whose only change is a placeholder hashes Clean. For each placeholder, apply the resolution algorithm, parent guard, duplicate handling, and snapshot-overwrite rule in `references/path-mapping.md` → "Commit-time backfill":
+
+- Resolve the captured target path (normalized sync-root-relative) against the union of pages created in this commit ∪ existing tracked pages; apply the parent guard (resolved target's `parent_page_id` must equal this file's page_id, where the root `index.md`'s page_id is `config.parent.page_id`).
+- On success, rewrite the placeholder in place to the canonical managed line, then **overwrite that page's snapshot to match** the new local content and persist the manifest (`local_hash` will not move, since both regexes are stripped).
+- Unresolvable / parent-mismatched placeholders are left in place with a warning; they are stripped from the Modified diff, so they never push to Notion as prose.
+- If multiple placeholders in one file resolve to the same target, convert the first and warn on the rest.
+
+This pass adds no Notion call: it uses the `page_id` from the New-page `notion-create-pages` responses (or the existing manifest) and writes only local files. The Notion child block stays at the page foot; only the local in-place position is set.
 
 ## Deleted pages
 

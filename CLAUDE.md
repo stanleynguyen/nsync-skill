@@ -53,6 +53,7 @@ These were earned through end-to-end dry-runs against a real Notion workspace. E
 6. **Image blocks use markdown syntax, not XML.** Notion's enhanced-markdown serializes `<image>` blocks as `![Caption](URL)` lines, not `<image>` tags. The strip rule lives in `references/notion-mcp-cheatsheet.md` → "Image-block lines" and is regex-driven (`^!\[[^\]]*\]\([^)]+\)(\s*\{[^}]*\})?$`). Inline `![]()` inside running text is preserved.
 7. **No MCP supports trashing a page.** Local-delete + commit prompts the user with `[O]rphan to workspace / [M]anual trash / [R]estore local`. `notion-update-data-source` with `in_trash: true` is database-only. Don't try to add a "delete page" shortcut — there isn't one.
 8. **Decoupled rename in v1.** Local filename change updates the PageRecord's `path` but does not rename the Notion page title (a future `/nsync:mv` would). If the directory portion of the path changed, queue a `notion-move-pages` to the new parent.
+9. **Placeholder child-link backfill keeps the snapshot in sync.** Placeholder child-link lines (`<!-- nsync:child -->`, no id, see `references/path-mapping.md` → "Placeholder child-link lines") are stripped from `local_hash` just like managed lines, and `/nsync:commit`'s backfill pass MUST overwrite the page's snapshot after rewriting them, exactly as pull-regeneration does (invariant #3), or the snapshot diverges from disk. "Pending placeholder" is always derived at runtime; never add a PageRecord field for it (keeps classification hash-only, invariant #2).
 
 ## Notion MCP — connector-only
 
@@ -75,6 +76,7 @@ This plugin uses the **Claude built-in Notion connector** exclusively. Tool name
 | Manifest schema (PageRecord fields, TrashEntry, hash pipeline) | `references/manifest-schema.md` first, then the JSON examples that consume it |
 | Conflict UX or three-state classifier | `references/conflict-protocol.md` first, then `commands/pull.md` and `commands/commit.md` |
 | Path layout or rename heuristic | `references/path-mapping.md` first, then `commands/{init,pull,commit,status}.md` |
+| Child-link / placeholder line behavior | `references/path-mapping.md` → "Child-link lines" first, then `commands/{commit,pull,status,diff}.md` and the hash pipeline in `manifest-schema.md` + `notion-mcp-cheatsheet.md` |
 | Which MCP tool a command calls | `references/notion-mcp-cheatsheet.md` first, then the relevant command's `allowed-tools` |
 | User-visible install or behavior | `README.md` |
 

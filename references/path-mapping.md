@@ -75,6 +75,22 @@ A line is an nsync-managed child link iff its entire trimmed content matches (ca
 ^\[[^\]]*\]\([^)]+\)\s*<!--\s*nsync:child\s+page_id="[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"(\s+external)?\s*-->\s*$
 ```
 
+### Placeholder child-link lines
+
+A **placeholder child-link line** is the managed form minus the `page_id`. The user authors it where they want a child link to sit, *before* the target page exists in Notion (so no UUID is available yet):
+
+```
+[<Title>](<relative-path>) <!-- nsync:child -->
+```
+
+Its recognition regex (case-insensitive, entire trimmed line, target path captured) is disjoint from the managed regex above: the managed line carries `page_id="<uuid>"` between `child` and `-->`, while the placeholder has `-->` immediately after `child`:
+
+```
+^\[[^\]]*\]\(([^)]+)\)\s*<!--\s*nsync:child\s*-->\s*$
+```
+
+A placeholder is resolved into a managed line **only at `/nsync:commit`** (see "Commit-time backfill" below), never at `/nsync:pull`. Until then it is user-owned text. Like managed lines, placeholder lines are stripped from both `local_hash` and `remote_hash` (see `manifest-schema.md` → "Markdown normalization"), so authoring one never marks `index.md` Modified, and `/nsync:status` and `/nsync:diff` surface pending placeholders in their own section instead.
+
 ### Auto-managed rule
 
 Child-link lines are **owned by nsync**, not the user:
@@ -83,20 +99,38 @@ Child-link lines are **owned by nsync**, not the user:
 - Local edits to the title text or relative path inside a child-link line are **discarded on next pull** (UUID match drives the rewrite). Document this so users don't waste effort editing them.
 - Local insert / delete / reorder of child-link lines does NOT propagate to Notion — the source of truth for the child list is Notion's page tree. (A future `/nsync:mv` could push reorder; out of scope for v1.)
 - Both `local_hash` and `remote_hash` strip child-link lines (and whole-line `<page url>` tags) before SHA-256 — see `manifest-schema.md` → "Markdown normalization". Adding, removing, renaming, or reordering a child therefore does NOT move either hash and never triggers the conflict prompt.
+- A **placeholder** child-link line (the no-`page_id` form above) is the exception to "owned by nsync": it is user-authored until `/nsync:commit` resolves it. `/nsync:pull` leaves placeholders untouched (see "Regeneration trigger"), and both hashes strip placeholder lines too.
 
 ### Regeneration trigger
 
-Runs inside `/nsync:pull` after the three-state classification (see `conflict-protocol.md`) for every PageRecord with `has_children: true`. Behavior:
+Runs inside `/nsync:pull` after the three-state classification (see `conflict-protocol.md`) for every PageRecord with `has_children: true`. "Existing" lines are the local lines matching **either** the managed recognition regex or the placeholder regex; "expected" lines are derived from the current `<page url>` tags. Behavior:
 
-- **`expected == existing`** byte-for-byte: no-op.
-- **`existing` non-empty, mismatch**: replace each existing line by UUID match (updates title/path); insert any newly-added expected lines after the last existing child-link line; drop any orphaned existing lines whose UUID is no longer in `expected`. Position of the first existing line is preserved.
-- **`existing` empty, `expected` non-empty** (migration case for already-init'd folders): if the local file's non-child-link content equals the snapshot's, overwrite with the regenerated body (positions match Notion). If local body has diverged, append all expected lines after the file's last non-empty line and surface a one-time `Added <N> child-link lines to <path>; reposition manually if desired.` message.
+- **`expected` == existing managed set** byte-for-byte (and no placeholders): no-op.
+- **Any existing line present (managed or placeholder), mismatch**: reconcile **managed lines only**: replace each existing managed line by UUID match (updates title/path), insert any newly-added expected lines after the last existing child-link line, and drop orphaned existing **managed** lines whose UUID is no longer in `expected`. **Placeholder lines are never UUID-matched, never orphan-dropped, and never reordered: they are left exactly in place** (resolution is commit-only). Position of the first existing line is preserved.
+- **No existing line at all** (neither managed nor placeholder) and `expected` non-empty (migration case for already-init'd folders): if the local file's non-child-link content (both regexes stripped) equals the snapshot's, overwrite with the regenerated body (positions match Notion). If local body has diverged, append all expected lines after the file's last non-empty line and surface a one-time `Added <N> child-link lines to <path>; reposition manually if desired.` message.
 
-The snapshot is overwritten to match. Hashes don't move; no spurious Modified state.
+The snapshot is overwritten to match. Hashes don't move; no spurious Modified state. Because a placeholder counts as an existing line, the migration-overwrite branch never fires while an uncommitted placeholder is present, so the placeholder survives the pull intact.
 
 ### `/nsync:commit` filtering
 
-Before constructing `update_content` hunks, `/nsync:commit` strips every child-link line from BOTH the snapshot AND the local content. Resulting hunks describe only prose edits; Notion's native child-page blocks stay untouched.
+Before constructing `update_content` hunks, `/nsync:commit` strips every child-link line **and every placeholder child-link line** (both regexes) from BOTH the snapshot AND the local content. Resulting hunks describe only prose edits; Notion's native child-page blocks stay untouched, and an unresolved placeholder is never pushed to Notion as a literal markdown link.
+
+### Commit-time backfill
+
+`/nsync:commit` resolves placeholder child-link lines into managed lines, in a pass that runs **after New-page creation and before the Modified-page diff** (so a just-created page already has a `page_id`, and the resolved managed line is then stripped from the diff). The pass scans **every `has_children` local file, regardless of its commit-set classification**: a parent whose only change is a placeholder hashes Clean (placeholder stripped) and is in neither the New nor Modified set, yet still needs backfill.
+
+For each placeholder line, with its captured target path:
+
+1. **Normalize** the captured path to sync-root-relative (join against the directory of the file being edited; forward slashes).
+2. **Resolve** to the PageRecord whose `path` equals it, searching the **union of pages created in this commit ∪ existing tracked pages**. Zero matches → unresolvable (step 5). Resolving against the union (not just this commit's New pages) makes the pass idempotent and safe to resume after an interrupted commit, and lets a placeholder also target an already-existing child.
+3. **Identify this file's page_id**: `config.parent.page_id` when the file is the root `index.md` (its own `parent_page_id` is `null`), otherwise the file's own page_id.
+4. **Parent guard**: the resolved target's `parent_page_id` must equal this file's page_id. If not (the target lives under a different parent, or is an out-of-tree/external page), treat as unresolvable (step 5), since Notion cannot represent it as a child block of this page.
+5. **On success**: rewrite the placeholder in place into the canonical managed line (title and relative path recomputed from the manifest / create response, plus the resolved UUID). **On unresolvable / parent-mismatch**: emit a warning, leave the line as a placeholder (it is stripped from the diff by the filtering rule above, so nothing is pushed as prose), and continue.
+6. **Duplicate targets**: if more than one placeholder in the same file resolves to the same target, convert the first (topmost) only, warn listing the rest, and leave the rest as placeholders. Never emit two managed lines for one child.
+
+After rewriting a file's placeholders, **overwrite that page's snapshot to match the new local content** and recompute `local_hash` (it will not move, since both regexes are stripped). This mirrors the pull "Regeneration trigger" snapshot rule and keeps the snapshot consistent with disk.
+
+Backfill changes only the **local** in-place position. The Notion child block stays where `notion-create-pages` appended it (the page foot); nsync v1 has no block-reorder operation. A subsequent `/nsync:pull` preserves the in-place managed line (UUID match, position preserved), so no duplicate appears.
 
 ## State lives in the manifest, not in file frontmatter
 

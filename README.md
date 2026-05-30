@@ -131,6 +131,8 @@ Depending on your Claude Code build the slash form may appear as `/nsync:init` o
 
 **PR-reviewable doc changes.** Commit `.nsync/manifest.json` and your local tree to git. The diff that lands in your pull request is human-readable markdown, not Notion's opaque block IDs; reviewers see exactly what changed, branch-based experimentation works, and rollback is a `git revert` away.
 
+**Create a sub-page and link it in place.** A new sub-page normally lands as a Notion child block at the page foot. To place the link mid-document instead, create the `.md` and drop a placeholder line where you want it, the managed child-link form minus the page id: `[Roadmap](./roadmap.md) <!-- nsync:child -->`. On `/nsync:commit`, nsync creates the page and backfills the real id in place: no duplicate, no broken link. The same placeholder also positions a link to an already-existing child. Caveat: this sets the **local** position only; Notion still renders the child block at the page foot (in-body reordering on the Notion side is a future `/nsync:mv`).
+
 ## How it works
 
 - **Scope:** only `*.md` files participate in sync. Any other extension is invisible to every command.

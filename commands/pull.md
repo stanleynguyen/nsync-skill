@@ -28,11 +28,11 @@ Read these references first:
 8. **Regenerate child-link lines** for every PageRecord with `has_children: true` (including the root). For each:
    - Use the already-fetched `remote_raw` from step 6.
    - Extract the ordered list of whole-line `<page url url="<href>"[ icon="..."]>Title</page>` tags → **expected** child-link lines (look up each target's local path in the manifest; render `external` if the UUID is absent).
-   - Scan the current local file for **existing** child-link lines via the regex in `references/path-mapping.md` → "Child-link lines" → "Recognition regex".
-   - Apply the "Regeneration trigger" rules in `path-mapping.md`:
-     - `expected == existing` byte-for-byte → no-op.
-     - `existing` non-empty, mismatch → replace each existing line by UUID match (rewrites title text and target path from current manifest data); insert any newly-added expected lines after the last existing child-link line; drop any orphaned existing lines whose UUID is no longer in `expected`. The position of the first existing line stays put.
-     - `existing` empty, `expected` non-empty (migration case) → if local non-child-link content equals snapshot non-child-link content (no user prose edits), overwrite the local file with `remote_raw` after substituting `<page url>` tags with child-link lines (positions match Notion). Otherwise append all expected lines after the file's last non-empty line and surface `Added <N> child-link lines to <path>; reposition manually if desired.`
+   - Scan the current local file for **existing** lines matching **either** the managed recognition regex or the placeholder regex in `references/path-mapping.md` → "Child-link lines".
+   - Apply the "Regeneration trigger" rules in `path-mapping.md` (reconcile **managed** lines only; leave **placeholder** lines exactly in place (they resolve at `/nsync:commit`, never here):
+     - `expected` == existing managed set byte-for-byte (and no placeholders) → no-op.
+     - any existing line present (managed or placeholder), mismatch → replace each existing **managed** line by UUID match (rewrites title text and target path from current manifest data); insert any newly-added expected lines after the last existing child-link line; drop orphaned existing **managed** lines whose UUID is no longer in `expected`. Placeholder lines are never UUID-matched, orphan-dropped, or reordered. The position of the first existing line stays put.
+     - no existing line at all (neither managed nor placeholder), `expected` non-empty (migration case) → if local non-child-link content (both regexes stripped) equals snapshot non-child-link content (no user prose edits), overwrite the local file with `remote_raw` after substituting `<page url>` tags with child-link lines (positions match Notion). Otherwise append all expected lines after the file's last non-empty line and surface `Added <N> child-link lines to <path>; reposition manually if desired.`
    - Overwrite the snapshot to match the new local file. Recompute `local_hash` and `remote_hash` per the pipeline; the strip rules make these stable so the manifest hashes are unchanged in steady state. Persist if anything moved.
 
 ## Per-state actions

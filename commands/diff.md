@@ -46,6 +46,7 @@ Resolve each positional arg in `$ARGUMENTS`:
 - **Added (local)** — `.md` files with no PageRecord (will become new Notion pages on commit). Show the file content as a "new file" diff.
 - **Deleted (local)** — PageRecords whose file is missing. Show the last snapshot as the deleted content.
 - **Rename suggestions (informational)** — heuristic matches that would be confirmed by status/pull/commit but are not applied here.
+- **Pending child-link placeholders** - for each `has_children` file in scope, list placeholder child-link lines (the placeholder regex in `references/path-mapping.md` → "Child-link lines") with their target path and whether each resolves. These become managed links on `/nsync:commit`; unresolvable ones are flagged. Read-only; nothing is rewritten here.
 - **No changes (explicit args only)** — paths the user named that resolved Clean. Print each as `<path>: no changes`.
 
 If `$ARGUMENTS` was non-empty, print a one-line summary of resolution warnings at the top (paths skipped + reason), so the user notices typos before scanning the diff.
