@@ -16,6 +16,72 @@ This plugin uses **Claude's built-in Notion connector exclusively**. Tools are s
 
 If a future version needs to run against a self-hosted or bundled Notion MCP, the snippet-based `update_content` and markdown-aware `notion-fetch` surface assumed throughout this document must be replicated — otherwise §G's rich-block-safe update strategy degrades.
 
+## Concurrency, batching & rate limits
+
+Commands are slow when per-page connector round-trips run one-at-a-time. They don't have to. This section is the single source of truth for how nsync schedules Notion calls; commands reference it instead of restating numbers.
+
+**`NSYNC_READ_BATCH = 4`** — the canonical read-concurrency constant. It is defined HERE and nowhere else. Commands say "in batches of `NSYNC_READ_BATCH` (see notion-mcp-cheatsheet.md → Concurrency)"; they never restate the number.
+
+### Rate ceiling
+
+The built-in connector proxies to the Notion API, which allows an **average of ~3 requests/second per connection** (2700 requests / 15 minutes). Short bursts above the average are tolerated. Over-limit calls return **HTTP 429 with a `Retry-After` header** (integer seconds). `NSYNC_READ_BATCH = 4` is deliberately conservative — it sits just above the sustained average to exploit burst allowance without churning on 429s.
+
+### Reads parallelize, writes serialize
+
+In Claude Code, read-only tool calls emitted **in a single assistant message** run concurrently; write tools are serialized. nsync follows that split:
+
+- **Parallel reads.** `notion-fetch` has no batch parameter (single `id` per call; "make multiple calls to fetch multiple entities"). To parallelize a per-page body-fetch loop, **emit up to `NSYNC_READ_BATCH` `notion-fetch` calls in one assistant message, await the whole batch, then emit the next batch.** Process each result (compute `remote_hash`, classify) as the batch lands. This applies to every "for each tracked page: `fetch`" loop in pull / status / diff / commit-staleness, and to init's per-page body fetches.
+- **Sequential search.** `notion-search` pagination stays one-call-at-a-time — each page needs the previous response's `next_page_token`. Do not try to parallelize pagination. The 500-page safety cap still applies.
+- **Serial writes.** `notion-update-page` and `notion-move-pages` stay one call per page. Do NOT batch them into a single assistant message expecting concurrency — Claude Code serializes writes and Notion would 429. The write-side optimization is hunk-batching (all hunks for one page in a single `content_updates[]` array), which is unchanged.
+
+### Batched creates (the one write that DOES batch)
+
+`notion-create-pages` accepts a `pages[]` array (max 100) where **all pages share one parent**. When creating multiple New pages:
+
+1. Group New files by their resolved parent `page_id`.
+2. Submit each group as **one `notion-create-pages` call** with every sibling in `pages[]`.
+3. Preserve topological order **across groups** — a parent's group must land (and yield `page_id`s) before any group whose parent is one of those just-created pages. Within a group, order `pages[]` so an `index.md` precedes siblings that resolve to it.
+
+This collapses N create-calls into (number of distinct parents) calls.
+
+### 429 backoff
+
+On a 429: read `Retry-After`, wait that many seconds, retry only the failed call. If 429s recur within the same command, drop the effective batch size to 2 for the remainder of the run. Never let a 429 corrupt state — a failed fetch just re-runs; a failed write leaves the manifest unpersisted for that page (atomicity rules already cover this).
+
+### Progress reporting (never go silent)
+
+Long operations must surface progress so the user is never left wondering whether the command hung. The rule: **emit a progress line at least once per minute, and never run silently for more than ~60 seconds.** In practice, report at the natural checkpoints — they fire well under a minute on any real tree:
+
+- **Batched read loops** (the per-page `notion-fetch` loops in pull / status / diff / init / commit-staleness): print one line **after each batch lands**, e.g. `Fetched 12/40 pages…`. Include the running count and the total.
+- **Write loops** (commit's New-page create groups, Modified-page updates, Deleted/Renamed moves): print a line **per group / per page** as each Notion write succeeds, e.g. `Created 3 pages under engineering/ (8/15 new pages)…` or `Pushed roadmap.md (4/9 modified)…`.
+- **Search pagination**: if enumerating a large tree takes more than a page or two, print `Enumerating sub-tree… (87 pages so far)` every few pages.
+- **Backoff waits**: when honoring a 429 `Retry-After`, say so — `Rate-limited by Notion; waiting 5s before retrying…` — so the pause looks intentional, not hung.
+
+Keep each line short and single-line (a running counter the user can watch tick up), not a paragraph. The final per-command output summary is unchanged; these are interim heartbeats during the work.
+
+### Sub-agent fan-out & context discipline
+
+The other half of the slowness was the main command holding every fetched page body in context — and re-processing all of it on every subsequent tool-call turn (cost scales with context size). The fix: **page bodies must never accumulate in the main command's context.** Deterministic work runs in `scripts/nsync.py` (see `manifest-schema.md` → "Compute helper"); the bulky read-and-hash work runs in sub-agents that return only compact records.
+
+**Compact record** — what a read sub-agent returns per page (small, fixed-size; the body is discarded inside the sub-agent):
+
+```
+{ "page_id": "...", "path": "...", "remote_hash": "sha256:...",
+  "has_children": true, "child_link_tags": ["<page url ...>Title</page>", ...],
+  "rich_blocks": [ { "type": "callout", "anchor": "before:## Setup" } ] }
+```
+
+- `child_link_tags` is the ordered list of whole-line `<page url>` tags only (pull's child-link regeneration consumes this — it never needs the full body). `rich_blocks` is the small summary for the PageRecord / diff annotation.
+- For `/nsync:diff`, the sub-agent returns the **rendered unified diff text** for its page instead of a record.
+- For `/nsync:commit` Modified pages, the sub-agent does the *entire* per-page chain — fetch `remote_raw` → `nsync.py diff` snapshot→local → validate `old_str` hunks (per "Rich-block-safe update" below) → `notion-update-page` → re-fetch → `nsync.py hash` — and returns `{ page_id, pushed, new_remote_hash, warnings }`. `remote_raw` stays inside the sub-agent.
+
+**Fan-out threshold.** Sub-agents have spawn overhead, so scale to the work:
+
+- **< 8 pages**: run inline (no sub-agents). **Process-and-discard**: fetch a batch, write each body to `.nsync/tmp/<page_id>.remote.md`, hash it with `nsync.py`, record the compact result, delete the temp file, and do NOT carry the body forward in later reasoning.
+- **≥ 8 pages**: dispatch sub-agents — one per `NSYNC_READ_BATCH`-sized batch for reads, one per page for commit Modified writes — bounded by the same concurrency cap. Each sub-agent fetches, runs `nsync.py`, returns the compact record, and its context (with the bodies) is discarded on return.
+
+Either path keeps the main loop holding only compact records, the manifest, and small local files — never tens of full page bodies. `.nsync/tmp/` is scratch space; clean it up at command end.
+
 ## Markdown normalization (hash pipeline)
 
 Both `local_hash` and `remote_hash` are SHA-256 over content processed through:
@@ -81,9 +147,9 @@ Track image blocks in the PageRecord's `rich_blocks` as entries of `type: "image
 
 The `/nsync:commit` strategy (snapshot-diff → snippet replace):
 
-1. Read `.nsync/snapshots/<page_id>.md` — markdown-only body at last sync.
-2. Read the local `.md` file — current state, markdown only.
-3. Diff snapshot → local with `diff -u`-style hunks.
+1. `.nsync/snapshots/<page_id>.md` — markdown-only body at last sync.
+2. The local `.md` file — current state, markdown only.
+3. Diff snapshot → local via `python3 "$CLAUDE_PLUGIN_ROOT/scripts/nsync.py" diff <snapshot> <local>` (it strips child-link lines from both sides first). Do NOT diff in-context.
 4. `fetch` the page to get `remote_raw` (with rich-block tags).
 5. For each hunk, build an `{ old_str, new_str }` pair. `old_str` MUST satisfy ALL of these constraints (verified by the dry-run — a substring-match without line boundaries can corrupt pages by replacing a fragment inside an unrelated line):
    1. **Line-bounded**: `old_str` begins at a line boundary (preceded by `\n` or position 0) and ends at a line boundary (followed by `\n` or end-of-string) within `remote_raw`.
@@ -96,7 +162,7 @@ The `/nsync:commit` strategy (snapshot-diff → snippet replace):
    - If multiple matches even after the line-boundary filter, surface the ambiguity to the user with a suggestion to add more context lines.
    - No rich-block tag or image-block line falls inside any `old_str` span. If one does, prompt the user: `[F]orce-replace (deletes the rich block) / [S]kip`.
 7. Submit all hunks for the file in a single `notion-update-page` call with `command="update_content"` and `content_updates=<array>`.
-8. On success: `fetch` again, recompute `remote_hash`, overwrite the snapshot with the new local content, refresh `last_synced_at`.
+8. On success: `fetch` again, recompute `remote_hash` via `nsync.py hash --mode remote`, overwrite the snapshot with the new local content, refresh `last_synced_at`.
 
 ## Trash gap (no MCP supports trashing a page)
 

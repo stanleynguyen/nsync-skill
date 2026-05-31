@@ -186,3 +186,20 @@ Apply identically to local file bytes and remote markdown bodies before SHA-256:
 7. **Both `remote_hash` and `local_hash`**: strip every whole-line `<page url ...>...</page>` tag AND every line matching the **child-link regex** OR the **placeholder child-link regex** in `path-mapping.md` → "Child-link lines". This is symmetric on both sides: the `<page url>` strip catches the remote form (what Notion serializes), and the child-link / placeholder strip catches the local forms (what nsync renders into `index.md`, plus user-authored placeholders awaiting commit-time backfill). Together they make child adds, removes, renames, reorders, and pending placeholders invisible to both hashes, so parent pages don't churn when children change.
 
 Both implementations (one for `local_hash`, one for `remote_hash`) must produce byte-identical output on byte-identical inputs. If a discrepancy is suspected during debugging, log both the canonicalized text and the hash alongside the conflict report.
+
+## Compute helper (`scripts/nsync.py`)
+
+The pipeline above is the **spec**; `${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py` is its **implementation**, and commands MUST execute it rather than performing hashing, normalization, or diffing in-context. An LLM cannot reliably compute SHA-256 and is slow at line-by-line string work; doing it by hand was the dominant source of command latency (see plan history). The script is pure Python 3 stdlib — no install step. Its regexes (rich-block tag list, image-line regex, managed + placeholder child-link regexes) are copied verbatim from this file, `path-mapping.md`, and `notion-mcp-cheatsheet.md`; if you change a regex or pipeline step in the spec, update `scripts/nsync.py` in the same edit and re-run its self-tests.
+
+CLI surface (FILE omitted or `-` reads stdin; `hash`/`normalize` take `--mode local|remote`):
+
+| Invocation | Output |
+|---|---|
+| `python3 "$CLAUDE_PLUGIN_ROOT/scripts/nsync.py" hash --mode local FILE` | `sha256:<hex>` of the normalized body — drop straight into `local_hash` |
+| `… hash --mode remote FILE` | `sha256:<hex>` for `remote_hash` (rich-block tags + image-block lines stripped) |
+| `… hash-batch --mode {local\|remote}` | reads NUL- or newline-delimited paths on stdin; prints `<path>\t<sha256:hex>` per line — **one process call hashes a whole batch** |
+| `… normalize --mode {local\|remote} FILE` | the normalized markdown-only body (for snapshot writes / diff inputs) |
+| `… strip-childlinks FILE` | body with managed + placeholder child-link lines removed (commit's pre-diff strip) |
+| `… diff SNAPSHOT LOCAL` | unified diff snapshot→local with child-link lines stripped from both sides |
+
+The `sha256:` prefix is included in the output, matching the `local_hash` / `remote_hash` field format above — no string surgery needed before writing the manifest.

@@ -1,6 +1,6 @@
 # nsync — repo guide for Claude
 
-This repo IS a Claude Code plugin. It is not application code. There is no build step, no test runner, no compiled output. The "code" is a set of Markdown command prompts plus reference documents that those prompts read at runtime.
+This repo IS a Claude Code plugin. It is not application code. There is no build step and no compiled output. The "code" is mostly a set of Markdown command prompts plus reference documents that those prompts read at runtime — plus one small Python helper (`scripts/nsync.py`) that the prompts shell out to for deterministic work (hashing, normalization, diffing) the LLM should not do by hand. That helper has inline self-tests (run it under `python3 - <<'PY'` style harnesses); everything else is validated by `claude plugin validate` + the end-to-end dry-run.
 
 ## What this plugin does
 
@@ -26,6 +26,8 @@ Read `README.md` if you want the end-user view. The rest of this file is for wor
 │   ├── path-mapping.md
 │   ├── conflict-protocol.md
 │   └── notion-mcp-cheatsheet.md
+├── scripts/                 # the ONE place deterministic work runs (not pure-prompt)
+│   └── nsync.py             # hash / normalize / strip-childlinks / diff — Python 3 stdlib
 ├── CLAUDE.md                # this file
 └── README.md                # user-facing install + verification
 ```
@@ -54,6 +56,9 @@ These were earned through end-to-end dry-runs against a real Notion workspace. E
 7. **No MCP supports trashing a page.** Local-delete + commit prompts the user with `[O]rphan to workspace / [M]anual trash / [R]estore local`. `notion-update-data-source` with `in_trash: true` is database-only. Don't try to add a "delete page" shortcut — there isn't one.
 8. **Decoupled rename in v1.** Local filename change updates the PageRecord's `path` but does not rename the Notion page title (a future `/nsync:mv` would). If the directory portion of the path changed, queue a `notion-move-pages` to the new parent.
 9. **Placeholder child-link backfill keeps the snapshot in sync.** Placeholder child-link lines (`<!-- nsync:child -->`, no id, see `references/path-mapping.md` → "Placeholder child-link lines") are stripped from `local_hash` just like managed lines, and `/nsync:commit`'s backfill pass MUST overwrite the page's snapshot after rewriting them, exactly as pull-regeneration does (invariant #3), or the snapshot diverges from disk. "Pending placeholder" is always derived at runtime; never add a PageRecord field for it (keeps classification hash-only, invariant #2).
+10. **Reads parallelize, writes serialize.** Per-page `notion-fetch` loops (pull/status/diff/init bodies, commit staleness) emit batches of `NSYNC_READ_BATCH` concurrent calls in a single assistant message; `notion-create-pages` batches siblings per shared parent (`pages[]`, max 100); `notion-update-page` / `notion-move-pages` stay one call per page (Claude Code serializes writes, and Notion's ~3 req/s ceiling 429s write bursts). `notion-search` pagination stays sequential (needs the prior `next_page_token`). The `NSYNC_READ_BATCH` constant lives ONLY in `references/notion-mcp-cheatsheet.md` → "Concurrency, batching & rate limits"; commands reference it, never restate the number. Don't add a per-repo concurrency field to the manifest — it's intentionally hardcoded. Long loops must also surface progress **at least once per minute** (never silent >~60s) per that reference's "Progress reporting" subsection — commands point at it; the cadence rule is not restated in command bodies.
+11. **Deterministic work runs in `scripts/nsync.py`, never in-context.** Every hash, normalization, child-link strip, and snapshot→local diff goes through the helper (`hash` / `hash-batch` / `normalize` / `strip-childlinks` / `diff`). The model must never compute a SHA-256 or strip tags "by reading the text" — it's slow and (for hashing) impossible to do reliably. The helper emits the `sha256:` prefix so output drops straight into `local_hash` / `remote_hash`. `diff.md` and `commit.md` therefore carry `Bash(python3:*)` in `allowed-tools`.
+12. **Page bodies never accumulate in the main command context.** Bulky read-and-hash work fans out to sub-agents that return only compact records (`{ page_id, remote_hash, has_children, child_link_tags, rich_blocks }`), or a rendered diff (diff), or a push result (commit Modified). The body lives in the sub-agent and is discarded on return. Below the fan-out threshold (~8 pages) run inline with process-and-discard (hash via temp file under `.nsync/tmp/`, drop the body). All five commands carry `Task` in `allowed-tools`. The fan-out rules + compact-record schema live ONLY in `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline". Manifest persistence is per-batch/phase, not per-page.
 
 ## Notion MCP — connector-only
 
@@ -78,6 +83,9 @@ This plugin uses the **Claude built-in Notion connector** exclusively. Tool name
 | Path layout or rename heuristic | `references/path-mapping.md` first, then `commands/{init,pull,commit,status}.md` |
 | Child-link / placeholder line behavior | `references/path-mapping.md` → "Child-link lines" first, then `commands/{commit,pull,status,diff}.md` and the hash pipeline in `manifest-schema.md` + `notion-mcp-cheatsheet.md` |
 | Which MCP tool a command calls | `references/notion-mcp-cheatsheet.md` first, then the relevant command's `allowed-tools` |
+| Concurrency / batching / rate-limit behavior (`NSYNC_READ_BATCH`, parallel fetch, batched creates, 429 backoff) | `references/notion-mcp-cheatsheet.md` → "Concurrency, batching & rate limits" first, then the per-page loops in `commands/{pull,status,diff,init,commit}.md` |
+| Hash / normalization / diff pipeline (the actual computation) | `references/manifest-schema.md` → "Markdown normalization" + "Compute helper" first, then `scripts/nsync.py` (keep them in lockstep), then re-run the helper self-tests |
+| Context discipline / sub-agent fan-out / compact-record schema | `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline" first, then the fetch loops in `commands/{pull,status,diff,init,commit}.md` |
 | User-visible install or behavior | `README.md` |
 
 The plan file at `/Users/stanley/.claude/plans/i-want-to-create-cosmic-frog.md` carries the full design history — sections A–J for the initial design, §K for the `/nsync:diff` arg grammar, §L for the post-dry-run fixes (L1 hash-only, L2 image-strip, L3 conflict snapshot, L4 verification order, L5 line-bounded `old_str`, L6 autolink doc), and §M for the connector-only migration. Read it before making non-trivial design changes.
@@ -101,11 +109,14 @@ There is no test suite. Validation is:
    grep -rn "last_seen_remote_modified" --include="*.md" --include="*.json" . | grep -v "There is intentionally no\|cache only; never authoritative"
    ```
 
-3. **End-to-end dry-run.** Follow the 10-step verification checklist in `README.md` against a throwaway Notion parent page. The previous two passes (logged in plan §J and §L verification notes) caught all the L-series bugs — a fresh dry-run should now complete without any manual snapshot tweaks or substring-match collisions.
+3. **Compute-helper self-tests.** `scripts/nsync.py` must reproduce the prose pipeline exactly. Re-run the inline assertions (idempotent `normalize`; rich-block / image-block / child-link / `<page url>` edits do NOT move the hash per invariants #2/#6/#9; prose edits DO; `sha256:`-prefixed 71-char output). After any regex/pipeline change, a Clean page must stay Clean (hash unchanged).
+
+4. **End-to-end dry-run.** Follow the 10-step verification checklist in `README.md` against a throwaway Notion parent page. The previous two passes (logged in plan §J and §L verification notes) caught all the L-series bugs — a fresh dry-run should now complete without any manual snapshot tweaks or substring-match collisions.
 
 ## Style
 
-- Markdown only. No code generation; no scripts.
+- Command bodies and references are Markdown. Deterministic computation (hashing, normalization, diffing, regex stripping) lives in `scripts/nsync.py` — NOT inline in prompts, and NOT performed by the model in-context. (This reverses the original "Markdown only, no scripts" rule; see plan history for why — the in-context computation was the dominant latency source and SHA-256 by an LLM is unreliable.) Keep the helper pure Python 3 stdlib, no pip install.
+- The references stay the SPEC; `scripts/nsync.py` is the implementation. If you change a regex or pipeline step in `manifest-schema.md` / `path-mapping.md` / `notion-mcp-cheatsheet.md`, update the helper in the same commit and re-run its self-tests.
 - Keep references self-consistent with each other — if you update a hash field in `manifest-schema.md`, audit `conflict-protocol.md` and `notion-mcp-cheatsheet.md` for the same field name.
 - Imperative voice in command bodies. Descriptive voice in references and README.
 - When you introduce a new design decision, append a section to the plan file (§N, §O, ...) rather than retroactively rewriting old sections — the history is load-bearing for understanding why the current design looks the way it does.

@@ -1,7 +1,7 @@
 ---
 description: Show local vs remote diff for tracked Notion pages (git diff analog)
 argument-hint: "[path...]"
-allowed-tools: Read, Glob, Bash(diff:*), Bash(pwd:*), mcp__claude_ai_Notion__notion-fetch, mcp__claude_ai_Notion__notion-search
+allowed-tools: Read, Glob, Bash(diff:*), Bash(pwd:*), Bash(python3:*), Task, mcp__claude_ai_Notion__notion-fetch, mcp__claude_ai_Notion__notion-search
 ---
 
 Show unified diff between local `.md` files and their remote Notion pages.
@@ -10,6 +10,8 @@ Read these references first:
 - @${CLAUDE_PLUGIN_ROOT}/references/manifest-schema.md
 - @${CLAUDE_PLUGIN_ROOT}/references/notion-mcp-cheatsheet.md
 - @${CLAUDE_PLUGIN_ROOT}/references/path-mapping.md
+
+**Never hash, normalize, or diff in-context.** Use `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py"` (see `references/manifest-schema.md` → "Compute helper") and keep page bodies out of this command's context per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline".
 
 Input: `$ARGUMENTS` contains zero or more positional path arguments. Each arg is either a `.md` file or a folder. Mixing is allowed. See "Argument resolution" below.
 
@@ -20,12 +22,12 @@ Input: `$ARGUMENTS` contains zero or more positional path arguments. Each arg is
 3. Capture the user's CWD (use `pwd` via Bash) so paths in `$ARGUMENTS` can be resolved relative to it.
 4. Run rename detection in REPORT-ONLY mode — list any candidates but do not apply them or write to the manifest.
 5. **Resolve `$ARGUMENTS` into a target set** (see "Argument resolution" below). If `$ARGUMENTS` is empty, target every tracked PageRecord plus any untracked `.md` discovered under the sync root.
-6. For each target: recompute `local_hash`, then `fetch` the remote page to retrieve current markdown (rich-block tags included). For Added-only targets there is no remote; for Deleted-only targets there is no local — handle the asymmetric diff accordingly.
+6. Recompute `local_hash` for all targets in one shot via `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" hash-batch --mode local`, classify each, and skip Clean ones per step 7. For the non-clean targets, produce the rendered diffs **without holding remote bodies in context**, per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline": ≥8 targets, dispatch one sub-agent per `NSYNC_READ_BATCH` batch; each fetches its pages and returns the **rendered unified diff text** for its targets (built per step 8). <8 targets, run inline with process-and-discard. Honor the 429 backoff and report progress per "Progress reporting" (e.g. `Diffed 12/40 pages…`). For Added-only targets there is no remote; for Deleted-only targets there is no local — handle the asymmetric diff accordingly.
 7. Skip pages whose state is Clean (no diff to show) UNLESS the user named the path explicitly as a file arg — in that case print a `<path>: no changes` line so the user knows the file was found.
-8. For each non-clean target, render a unified diff:
-   - LEFT (local) — the local `.md` file after normalization. For Deleted targets, use the last snapshot from `.nsync/snapshots/<page_id>.md`.
-   - RIGHT (remote) — the remote markdown-only body. Rich-block tags MUST be replaced with a single placeholder line per block, formatted exactly as `[rich block: <type>] (not synced)`. Use the manifest's `rich_blocks` entries to label types when possible; fall back to the tag name from the fetched body. For Added targets, the right side is empty (new file).
-   - Use `diff -u` via Bash when convenient, or generate the unified output directly.
+8. The rendered unified diff for each non-clean target (built by the sub-agent, or inline for <8 targets):
+   - LEFT (local) — the local `.md` file via `nsync.py normalize --mode local`. For Deleted targets, use the last snapshot from `.nsync/snapshots/<page_id>.md`.
+   - RIGHT (remote) — the remote markdown-only body via `nsync.py normalize --mode remote`. Rich-block tags MUST be replaced with a single placeholder line per block, formatted exactly as `[rich block: <type>] (not synced)`. Use the manifest's `rich_blocks` entries to label types when possible; fall back to the tag name from the fetched body. For Added targets, the right side is empty (new file).
+   - Generate the unified output with `nsync.py diff` (or `diff -u` via Bash) — never by hand.
 9. Render targets in natural sort order of their sync-root-relative path (stable across invocations regardless of arg order).
 
 ## Argument resolution

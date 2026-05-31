@@ -41,6 +41,10 @@ my-docs/                       ← sync root (your local working dir)
 
 ## Install
 
+### Prerequisite: Python 3
+
+nsync shells out to a small bundled helper (`scripts/nsync.py`) for the deterministic work (content hashing, markdown normalization, diffing), so the model never does it by hand (slow, and unreliable for hashing). You need **Python 3 on your `PATH`** (`python3 --version` should print 3.x). It's standard-library only: no `pip install`, no virtualenv. macOS and most Linux distros already ship it.
+
 ### Prerequisite: connect Notion
 
 The plugin uses Anthropic's built-in Notion connector. Connect it once before installing:
@@ -139,8 +143,9 @@ Depending on your Claude Code build the slash form may appear as `/nsync:init` o
 - **Layout:** Notion sub-pages map to local files, with pages-that-have-children rendered as a folder containing `index.md` (the body of that page itself) plus one `.md` per child.
 - **State:** `.nsync/` at the sync root holds `config.json` (parent identity), `manifest.json` (per-page UUID + hashes + rich-block records), `ignore` (gitignore-syntax filter for `.md` files), and `snapshots/<page_id>.md` (last-synced markdown bodies that drive safe commits).
 - **Rich blocks preserved.** Callouts, toggles, databases, embeds, equations, images don't round-trip through standard markdown. Rather than mangling them, `nsync` only ever updates the markdown portion of each page via snippet-level `update_content` calls; every rich block stays exactly where the Notion author put it.
+- **Built for big trees.** Page reads run in parallel batches, the deterministic work (hash / normalize / diff) runs in the bundled `scripts/nsync.py` helper instead of in-context, and on larger trees the per-page fetch-and-hash work fans out to sub-agents that return only compact records. The upshot: command time tracks how fast Notion responds, not how many pages you have. Long operations report progress at least once a minute so nothing looks hung.
 
-If you check `.nsync/` into git, ignore `.nsync/snapshots/` (large, regeneratable) and `.nsync/conflicts/` (transient). Keep `.nsync/config.json`, `.nsync/manifest.json`, `.nsync/ignore` checked in for team visibility.
+If you check `.nsync/` into git, ignore `.nsync/snapshots/` (large, regeneratable), `.nsync/conflicts/` (transient), and `.nsync/tmp/` (scratch space cleaned up after each run). Keep `.nsync/config.json`, `.nsync/manifest.json`, `.nsync/ignore` checked in for team visibility.
 
 ### Default ignore patterns
 
