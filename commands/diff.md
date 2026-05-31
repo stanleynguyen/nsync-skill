@@ -1,7 +1,7 @@
 ---
 description: Show local vs remote diff for tracked Notion pages (git diff analog)
 argument-hint: "[path...]"
-allowed-tools: Read, Glob, Bash(diff:*), Bash(pwd:*), Bash(python3:*), Task, mcp__claude_ai_Notion__notion-fetch, mcp__claude_ai_Notion__notion-search
+allowed-tools: Read, Glob, Bash(diff:*), Bash(pwd:*), Bash(python3:*), Task, Workflow, mcp__claude_ai_Notion__notion-fetch
 ---
 
 Show unified diff between local `.md` files and their remote Notion pages.
@@ -10,6 +10,7 @@ Read these references first:
 - @${CLAUDE_PLUGIN_ROOT}/references/manifest-schema.md
 - @${CLAUDE_PLUGIN_ROOT}/references/notion-mcp-cheatsheet.md
 - @${CLAUDE_PLUGIN_ROOT}/references/path-mapping.md
+- @${CLAUDE_PLUGIN_ROOT}/references/sub-agent-schemas.md
 
 **Never hash, normalize, or diff in-context.** Use `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py"` (see `references/manifest-schema.md` → "Compute helper") and keep page bodies out of this command's context per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline".
 
@@ -22,7 +23,7 @@ Input: `$ARGUMENTS` contains zero or more positional path arguments. Each arg is
 3. Capture the user's CWD (use `pwd` via Bash) so paths in `$ARGUMENTS` can be resolved relative to it.
 4. Run rename detection in REPORT-ONLY mode — list any candidates but do not apply them or write to the manifest.
 5. **Resolve `$ARGUMENTS` into a target set** (see "Argument resolution" below). If `$ARGUMENTS` is empty, target every tracked PageRecord plus any untracked `.md` discovered under the sync root.
-6. Recompute `local_hash` for all targets in one shot via `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" hash-batch --mode local`, classify each, and skip Clean ones per step 7. For the non-clean targets, produce the rendered diffs **without holding remote bodies in context**, per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline": ≥8 targets, dispatch one sub-agent per `NSYNC_READ_BATCH` batch; each fetches its pages and returns the **rendered unified diff text** for its targets (built per step 8). <8 targets, run inline with process-and-discard. Honor the 429 backoff and report progress per "Progress reporting" (e.g. `Diffed 12/40 pages…`). For Added-only targets there is no remote; for Deleted-only targets there is no local — handle the asymmetric diff accordingly.
+6. Recompute `local_hash` for all targets in one shot via `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" hash-batch --mode local`, classify each, and skip Clean ones per step 7. For the non-clean targets, produce the rendered diffs **without holding remote bodies in context**, per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline": ≥8 targets, dispatch via `Workflow` — one sub-agent per page (one per target, not batched, because each diff render is independent and per-page latency dominates). Each sub-agent returns a `DiffTextRecord` validated against `references/sub-agent-schemas.md`: `{ page_id, path, diff_text, ok, error }`. <8 targets, run inline with process-and-discard. Honor the 429 backoff and report progress per "Progress reporting" (e.g. `Diffed 12/40 pages…`). For Added-only targets there is no remote; for Deleted-only targets there is no local — handle the asymmetric diff accordingly. The main loop concatenates `diff_text` for records where `ok: true`; for `ok: false` records render `# <path>: <error>` so a single sub-agent failure can't silently truncate the diff stream.
 7. Skip pages whose state is Clean (no diff to show) UNLESS the user named the path explicitly as a file arg — in that case print a `<path>: no changes` line so the user knows the file was found.
 8. The rendered unified diff for each non-clean target (built by the sub-agent, or inline for <8 targets):
    - LEFT (local) — the local `.md` file via `nsync.py normalize --mode local`. For Deleted targets, use the last snapshot from `.nsync/snapshots/<page_id>.md`.

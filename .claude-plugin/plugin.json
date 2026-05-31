@@ -1,6 +1,6 @@
 {
   "name": "nsync",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Git-style sync between local markdown files and a Notion parent page tree. Uses Claude's built-in Notion connector.",
   "author": {
     "name": "stanleynguyen",

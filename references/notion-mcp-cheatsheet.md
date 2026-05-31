@@ -31,7 +31,7 @@ The built-in connector proxies to the Notion API, which allows an **average of ~
 In Claude Code, read-only tool calls emitted **in a single assistant message** run concurrently; write tools are serialized. nsync follows that split:
 
 - **Parallel reads.** `notion-fetch` has no batch parameter (single `id` per call; "make multiple calls to fetch multiple entities"). To parallelize a per-page body-fetch loop, **emit up to `NSYNC_READ_BATCH` `notion-fetch` calls in one assistant message, await the whole batch, then emit the next batch.** Process each result (compute `remote_hash`, classify) as the batch lands. This applies to every "for each tracked page: `fetch`" loop in pull / status / diff / commit-staleness, and to init's per-page body fetches.
-- **Sequential search.** `notion-search` pagination stays one-call-at-a-time — each page needs the previous response's `next_page_token`. Do not try to parallelize pagination. The 500-page safety cap still applies.
+- **`notion-search` is NOT a tree-listing API.** It is a semantic search with an undocumented relevance ceiling — pagination does NOT make it exhaustive. On a 96-page tree with `page_url=<parent>` and `query="."`, full pagination returned 15 pages, not 96. Never rely on `search` to enumerate "what pages exist under a parent." Derive reachability instead from the parent fetch's `<page url>` children unioned with every `has_children: true` page's freshly-fetched `child_link_tags` (the data is already in flight for the per-page hash step). `notion-search` remains valid for genuinely semantic lookups (e.g., finding a candidate page by user-supplied query text), but no command in v1 uses it for tree enumeration.
 - **Serial writes.** `notion-update-page` and `notion-move-pages` stay one call per page. Do NOT batch them into a single assistant message expecting concurrency — Claude Code serializes writes and Notion would 429. The write-side optimization is hunk-batching (all hunks for one page in a single `content_updates[]` array), which is unchanged.
 
 ### Batched creates (the one write that DOES batch)
@@ -63,24 +63,18 @@ Keep each line short and single-line (a running counter the user can watch tick 
 
 The other half of the slowness was the main command holding every fetched page body in context — and re-processing all of it on every subsequent tool-call turn (cost scales with context size). The fix: **page bodies must never accumulate in the main command's context.** Deterministic work runs in `scripts/nsync.py` (see `manifest-schema.md` → "Compute helper"); the bulky read-and-hash work runs in sub-agents that return only compact records.
 
-**Compact record** — what a read sub-agent returns per page (small, fixed-size; the body is discarded inside the sub-agent):
+**Return shapes are schema-validated.** Three distinct sub-agent return types are in flight across the plugin — `CompactReadRecord` (status / pull / init / diff read paths), `CommitWriteResult` (commit Modified writes), and `DiffTextRecord` (diff render). Each is specified as a JSON Schema in `references/sub-agent-schemas.md`. Commands reference the schema by name; sub-agents return data through it; the dispatcher validates at the tool-call layer. Prose-only field lists (the v0 contract) were retired after a 24-agent run produced five different return shapes — see plan history in `i-want-to-create-cosmic-frog.md`.
 
-```
-{ "page_id": "...", "path": "...", "remote_hash": "sha256:...",
-  "has_children": true, "child_link_tags": ["<page url ...>Title</page>", ...],
-  "rich_blocks": [ { "type": "callout", "anchor": "before:## Setup" } ] }
-```
-
-- `child_link_tags` is the ordered list of whole-line `<page url>` tags only (pull's child-link regeneration consumes this — it never needs the full body). `rich_blocks` is the small summary for the PageRecord / diff annotation.
-- For `/nsync:diff`, the sub-agent returns the **rendered unified diff text** for its page instead of a record.
-- For `/nsync:commit` Modified pages, the sub-agent does the *entire* per-page chain — fetch `remote_raw` → `nsync.py diff` snapshot→local → validate `old_str` hunks (per "Rich-block-safe update" below) → `notion-update-page` → re-fetch → `nsync.py hash` — and returns `{ page_id, pushed, new_remote_hash, warnings }`. `remote_raw` stays inside the sub-agent.
+**Dispatch tool.** For the ≥8-pages branch, sub-agents MUST be dispatched via the `Workflow` tool's `agent(prompt, { schema, label, phase, agentType })` form — the schema arg is what forces structured output. Plain `Agent`-tool calls are allowed only for the <8 inline branch (where the main loop owns the fetches and there is no schema to enforce). For read fan-outs set `agentType: 'Explore'`; for commit Modified writes omit `agentType` (default workflow agent — needs `notion-update-page` permissions).
 
 **Fan-out threshold.** Sub-agents have spawn overhead, so scale to the work:
 
 - **< 8 pages**: run inline (no sub-agents). **Process-and-discard**: fetch a batch, write each body to `.nsync/tmp/<page_id>.remote.md`, hash it with `nsync.py`, record the compact result, delete the temp file, and do NOT carry the body forward in later reasoning.
-- **≥ 8 pages**: dispatch sub-agents — one per `NSYNC_READ_BATCH`-sized batch for reads, one per page for commit Modified writes — bounded by the same concurrency cap. Each sub-agent fetches, runs `nsync.py`, returns the compact record, and its context (with the bodies) is discarded on return.
+- **≥ 8 pages**: dispatch via `Workflow` — one sub-agent per `NSYNC_READ_BATCH`-sized batch for reads (sub-agent returns `BatchReadRecords`), one per page for commit Modified writes (sub-agent returns `CommitWriteResult`). Bounded by the workflow concurrency cap. Each sub-agent fetches, runs `nsync.py`, returns the schema-validated record, and its context (with the bodies) is discarded on return.
 
 Either path keeps the main loop holding only compact records, the manifest, and small local files — never tens of full page bodies. `.nsync/tmp/` is scratch space; clean it up at command end.
+
+**Note on `child_link_tags`.** Notion serializes `<page url>` URLs inconsistently — canonical (undashed 32-hex), HTML-escaped, bare URL, and the hybrid 8-4-rest-no-dashes form have all been observed in a single run. Never write inline URL→UUID regex in commands; pipe the tag list through `python3 nsync.py extract-uuids` (`manifest-schema.md` → "Compute helper") which is tolerant of all four forms and always emits canonical dashed UUIDs.
 
 ## Markdown normalization (hash pipeline)
 
@@ -123,10 +117,11 @@ These appear in the enhanced-markdown serialization from `fetch` and must be str
 - `<column_list>...</column_list>` and inner `<column>...</column>`
 - `<button>...</button>`
 - `<ai_block>...</ai_block>`
+- `<empty-block/>` (Notion's serialization of an empty paragraph block — present whenever a page body is "empty" in the UI but holds a single zero-content block)
 - `<page url="...">` (child-page references — handled by their own PageRecord)
 - `<data-source url="...">` (databases — out of scope)
 
-If a tag we don't recognize appears, log a warning and treat its content as opaque (strip the entire tag span before hashing).
+If a tag we don't recognize appears, log a warning and treat its content as opaque (strip the entire tag span before hashing). `scripts/nsync.py` implements this fallback via `_warn_strip_unknown` — every unknown tag name produces one stderr warning per process, then is removed. The whitelist of HTML-passthrough inline tags (`<b>`, `<em>`, `<span>`, etc.) is in `nsync.py:HTML_PASSTHROUGH_TAGS`; the unknown-tag fallback skips those.
 
 ### Image-block lines (markdown syntax, not XML)
 

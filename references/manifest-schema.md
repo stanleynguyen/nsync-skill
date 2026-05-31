@@ -17,7 +17,7 @@ Recommended `.gitignore` if the sync root lives in git: ignore `.nsync/snapshots
 ```json
 {
   "schema_version": 1,
-  "plugin_version": "0.2.0",
+  "plugin_version": "0.2.1",
   "parent": {
     "page_id": "fb1d8c3a-5e21-4f70-8a23-9c4b6d8e1f02",
     "url": "https://www.notion.so/workspace/My-Docs-fb1d8c3a5e214f708a239c4b6d8e1f02",
@@ -34,7 +34,7 @@ Written once by `/nsync:init`. Read-only after that — never mutated by other c
 ```json
 {
   "schema_version": 1,
-  "plugin_version": "0.2.0",
+  "plugin_version": "0.2.1",
   "parent": { "page_id": "...", "url": "...", "title": "..." },
   "pages": {
     "<page_uuid>": { /* PageRecord */ }
@@ -121,7 +121,7 @@ Entries are kept indefinitely. Volume stays low because trash events are rare.
 ```json
 {
   "schema_version": 1,
-  "plugin_version": "0.2.0",
+  "plugin_version": "0.2.1",
   "parent": {
     "page_id": "fb1d8c3a-5e21-4f70-8a23-9c4b6d8e1f02",
     "url": "https://www.notion.so/workspace/Docs-fb1d8c3a5e214f708a239c4b6d8e1f02",

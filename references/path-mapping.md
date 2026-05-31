@@ -35,12 +35,14 @@ Only `*.md` files (case-insensitive) participate in sync. Any other extension is
 
 ## Non-empty parent body
 
-After the markdown normalization pipeline (rich-block tags + image-block lines + child-page `<page url>` tags stripped — see `notion-mcp-cheatsheet.md`), the residual markdown is the parent's "body content". Treat it as **empty** if any of:
+After the markdown normalization pipeline (rich-block tags + `<empty-block/>` + unknown-tag fallback + image-block lines + child-page `<page url>` tags stripped — see `notion-mcp-cheatsheet.md`), the residual markdown is the parent's "body content". Treat it as **empty** if any of:
 
 - Length after `strip()` is 0.
 - The only remaining content is the title heading line (`# <Parent title>\n`).
 
 Otherwise it is non-empty and the sync root gets an `index.md` per rule #1.
+
+Implementation note: run the check via `python3 nsync.py normalize --mode remote <body>` and compare the output to `""` (after `strip()`) or to the title-heading line. Do NOT pattern-match the input bytes — that misses `<empty-block/>` and any other rich-block residue.
 
 ## Root-page constraints
 
@@ -103,7 +105,7 @@ Child-link lines are **owned by nsync**, not the user:
 
 ### Regeneration trigger
 
-Runs inside `/nsync:pull` after the three-state classification (see `conflict-protocol.md`) for every PageRecord with `has_children: true`. "Existing" lines are the local lines matching **either** the managed recognition regex or the placeholder regex; "expected" lines are derived from the current `<page url>` tags. Behavior:
+Runs inside `/nsync:pull` after the three-state classification (see `conflict-protocol.md`) for every PageRecord with `has_children: true`. "Existing" lines are the local lines matching **either** the managed recognition regex or the placeholder regex; "expected" lines are derived from the current `<page url>` tags (in `child_link_tags` on each fetched record — UUIDs always extracted via `python3 nsync.py extract-uuids`, never an inline regex; Notion serializes these URLs in several inconsistent forms, see `notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline"). Behavior:
 
 - **`expected` == existing managed set** byte-for-byte (and no placeholders): no-op.
 - **Any existing line present (managed or placeholder), mismatch**: reconcile **managed lines only**: replace each existing managed line by UUID match (updates title/path), insert any newly-added expected lines after the last existing child-link line, and drop orphaned existing **managed** lines whose UUID is no longer in `expected`. **Placeholder lines are never UUID-matched, never orphan-dropped, and never reordered: they are left exactly in place** (resolution is commit-only). Position of the first existing line is preserved.

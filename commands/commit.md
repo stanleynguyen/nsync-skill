@@ -1,7 +1,7 @@
 ---
 description: Push local .md changes to Notion (git commit + push analog)
 argument-hint: "[--force <path>...]"
-allowed-tools: Read, Write, Edit, Glob, Bash(diff:*), Bash(python3:*), Task, AskUserQuestion, mcp__claude_ai_Notion__notion-fetch, mcp__claude_ai_Notion__notion-search, mcp__claude_ai_Notion__notion-update-page, mcp__claude_ai_Notion__notion-create-pages, mcp__claude_ai_Notion__notion-move-pages
+allowed-tools: Read, Write, Edit, Glob, Bash(diff:*), Bash(python3:*), Task, Workflow, AskUserQuestion, mcp__claude_ai_Notion__notion-fetch, mcp__claude_ai_Notion__notion-update-page, mcp__claude_ai_Notion__notion-create-pages, mcp__claude_ai_Notion__notion-move-pages
 ---
 
 Push local markdown changes to Notion. Workspace-wide staleness guard; `--force <path>` to override per-file.
@@ -11,8 +11,9 @@ Read these references first — they hold the rich-block-safe update strategy an
 - @${CLAUDE_PLUGIN_ROOT}/references/path-mapping.md
 - @${CLAUDE_PLUGIN_ROOT}/references/conflict-protocol.md
 - @${CLAUDE_PLUGIN_ROOT}/references/notion-mcp-cheatsheet.md
+- @${CLAUDE_PLUGIN_ROOT}/references/sub-agent-schemas.md
 
-**Never hash, normalize, strip child-links, or diff in-context.** Run all of it through `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py"` (see `references/manifest-schema.md` → "Compute helper"), and keep page bodies out of this command's context per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline".
+**Never hash, normalize, strip child-links, diff, or extract UUIDs in-context.** Run all of it through `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py"` (see `references/manifest-schema.md` → "Compute helper"), and keep page bodies out of this command's context per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline".
 
 Input: `$ARGUMENTS` may contain `--force <path>` (repeatable). Parse them out before the workspace-wide check.
 
@@ -21,7 +22,7 @@ Input: `$ARGUMENTS` may contain `--force <path>` (repeatable). Parse them out be
 1. Walk upward to locate `.nsync/`. Abort if missing.
 2. Load manifest + ignore. Apply ignore matcher. Parse `--force` paths from arguments.
 3. Recompute `local_hash` for every tracked file in one shot via `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" hash-batch --mode local`. Run rename detection (apply confirmed renames to PageRecord paths now — these will be pushed as `notion-move-pages` calls in step 7 if the directory portion changed). Rename detection skips any PageRecord with `parent_page_id: null` (the root entry — its path is fixed at `index.md` and cannot be renamed in v1).
-4. Get every tracked page's fresh `remote_hash` for the staleness check **without holding bodies in context**, per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline". ≥8 pages: dispatch one sub-agent per `NSYNC_READ_BATCH` batch; each fetches its pages, runs `nsync.py hash --mode remote`, and returns the compact record. <8 pages: run inline with process-and-discard. Honor the 429 backoff and report progress per "Progress reporting" (e.g. `Checked 12/40 pages…`). Do NOT retain `remote_raw` here — the Modified-page step re-fetches `remote_raw` inside its own per-page sub-agent (that is where `old_str` validation needs it).
+4. Get every tracked page's fresh `remote_hash` for the staleness check **without holding bodies in context**, per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline". ≥8 pages: dispatch via `Workflow` — one sub-agent per `NSYNC_READ_BATCH` batch, each returning `BatchReadRecords` validated against `references/sub-agent-schemas.md`. <8 pages: run inline with process-and-discard. Honor the 429 backoff and report progress per "Progress reporting" (e.g. `Checked 12/40 pages…`). Do NOT retain `remote_raw` here — the Modified-page step re-fetches `remote_raw` inside its own per-page sub-agent (that is where `old_str` validation needs it).
 5. **Workspace-wide staleness check**: for every tracked page NOT in the `--force` set, verify `remote_hash == manifest.remote_hash`. If any page fails this check, abort with: "Remote has changes you haven't pulled. Run /nsync:pull first. To override specific files, pass `--force <path>` for each." When listing the offending pages, show the manifest's stored `remote_hash` prefix vs the freshly-computed one so the user sees what diverged.
 6. Compute the commit set:
    - **Modified** — file exists, `local_hash != manifest.local_hash`, PageRecord exists.
@@ -33,19 +34,22 @@ Input: `$ARGUMENTS` may contain `--force <path>` (repeatable). Parse them out be
 
 ## Modified pages — rich-block-safe update via `update_content`
 
-Handle Modified pages with the **per-page sub-agent pattern** (see `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline"): ≥8 Modified pages → one sub-agent per page; <8 → inline. Each runs the full chain below and returns `{ page_id, pushed, new_remote_hash, warnings }` — `remote_raw` never enters the main context. Report progress per "Progress reporting" as each page is pushed (e.g. `Pushed roadmap.md (4/9 modified)…`). The per-page chain:
+Handle Modified pages with the **per-page sub-agent pattern** (see `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline"): ≥8 Modified pages → dispatch via `Workflow` with one sub-agent per page (no `agentType` override — needs `notion-update-page` permissions); <8 → inline. Each runs the full chain below and returns a `CommitWriteResult` (`references/sub-agent-schemas.md`) — `remote_raw` never enters the main context. Report progress per "Progress reporting" as each page is pushed (e.g. `Pushed roadmap.md (4/9 modified)…`). The per-page chain:
 
 1. The local `.md` file and the snapshot at `.nsync/snapshots/<page_id>.md`.
 1a. **Strip child-link lines AND placeholder child-link lines from both** before diffing, via `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" strip-childlinks`. These lines are nsync-managed (placeholders are resolved by the Backfill pass above): the user does not own them, Notion does not consume them, and pushing them via `update_content` would create plain markdown links that conflict with Notion's native child-page blocks. Reordering, renaming, inserting, or deleting child-link lines locally produces ZERO hunks, out of scope for v1. (A future `/nsync:mv` could push child reorders via the Notion API.)
 2. Diff snapshot → local via `nsync.py diff <snapshot> <local>` (it strips child-link lines from both sides) to produce hunks. Never diff in-context.
 3. `fetch` this page to get `remote_raw` (with rich-block tags) inside the sub-agent.
 4. For each hunk, construct an `{ old_str, new_str }` pair following the strict line-boundary rule in `references/notion-mcp-cheatsheet.md` ("Rich-block-safe update via `update_content`" → step 5). Briefly: `old_str` must begin and end at line boundaries within `remote_raw`, cover the entire start and end lines of the change, include at least one full unchanged line of leading and trailing context where available, and be uniquely line-bounded-matchable in `remote_raw`. A short fragment like `"Read the README."` is NEVER acceptable as `old_str` — it can substring-match inside a longer line like `"Read the README and the CONTRIBUTING guide."` and corrupt the page.
-   Validation rejects the hunk (and refuses the file's commit, with an actionable message) if:
+   Validation rejects the hunk (and refuses **this file's** commit, with an actionable message) if:
    - `old_str` doesn't appear under a full-line-bounded match → race detected; re-pull this file.
    - More than one line-bounded match exists → ambiguous; ask the user to enlarge the context manually.
    - A rich-block tag or image-block line falls inside the `old_str` span → prompt `[F]orce-replace (deletes the rich block) / [S]kip`.
+
+   **Recovery is per-file, not per-batch.** A refused file returns `CommitWriteResult { pushed: false, new_remote_hash: null, error: "<reason>" }`. The main loop continues processing the remaining Modified pages; the failed file is surfaced in the output summary so the user can re-pull just that one. The commit batch never aborts because a single page lost a race or had an ambiguous hunk.
+
 5. Submit all hunks for the file in a single `notion-update-page` call with `command="update_content"` and `content_updates=<array>`.
-6. On success: `fetch` the page again, recompute `remote_hash` via `nsync.py hash --mode remote`, overwrite `.nsync/snapshots/<page_id>.md` with the new local content, refresh `last_synced_at` in the PageRecord. Return the compact result to the main loop, which persists the manifest once per batch.
+6. On success: `fetch` the page again, recompute `remote_hash` via `nsync.py hash --mode remote`, overwrite `.nsync/snapshots/<page_id>.md` with the new local content, refresh `last_synced_at` in the PageRecord. Return `CommitWriteResult { pushed: true, new_remote_hash: "sha256:…", warnings: [] }`. The main loop persists the manifest once per batch.
 
 ## New pages
 
