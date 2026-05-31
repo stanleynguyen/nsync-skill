@@ -33,7 +33,7 @@ Once preflight passes:
 
 1. Capture parent page metadata (UUID, title, URL).
 2. Create `.nsync/` with:
-   - `config.json` — `{ schema_version: 1, plugin_version: "0.1.0", parent: { page_id, url, title }, created_at: <RFC3339 UTC> }`
+   - `config.json` — `{ schema_version: 1, plugin_version: "0.2.0", parent: { page_id, url, title }, created_at: <RFC3339 UTC> }`
    - `manifest.json` — initial shell with parent populated, `pages: {}`, `trash_log: []`. Sorted-key, two-space-indented.
    - `ignore` — copy the "Default ignore patterns" block from `references/path-mapping.md` verbatim.
    - `snapshots/` — empty directory.
