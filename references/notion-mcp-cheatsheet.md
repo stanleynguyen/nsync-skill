@@ -69,10 +69,32 @@ The other half of the slowness was the main command holding every fetched page b
 
 **Fan-out threshold.** Sub-agents have spawn overhead, so scale to the work:
 
-- **< 8 pages**: run inline (no sub-agents). **Process-and-discard**: fetch a batch, write each body to `.nsync/tmp/<page_id>.remote.md`, hash it with `nsync.py`, record the compact result, delete the temp file, and do NOT carry the body forward in later reasoning.
-- **≥ 8 pages**: dispatch via `Workflow` — one sub-agent per `NSYNC_READ_BATCH`-sized batch for reads (sub-agent returns `BatchReadRecords`), one per page for commit Modified writes (sub-agent returns `CommitWriteResult`). Bounded by the workflow concurrency cap. Each sub-agent fetches, runs `nsync.py`, returns the schema-validated record, and its context (with the bodies) is discarded on return.
+- **< 8 pages**: run inline (no sub-agents). **Process-and-discard**: fetch a batch, write each response's full `text` field verbatim to `.nsync/tmp/<page_id>.fetch.txt`, run it through the extraction pipeline (below) to produce `.nsync/tmp/<page_id>.remote.md`, hash the body with `nsync.py hash --mode remote`, record the compact result, delete both temp files, and do NOT carry the body forward in later reasoning.
+- **≥ 8 pages**: dispatch via `Workflow` — one sub-agent per `NSYNC_READ_BATCH`-sized batch for reads (sub-agent returns `BatchReadRecords`), one per page for commit Modified writes (sub-agent returns `CommitWriteResult`). Bounded by the workflow concurrency cap. Each sub-agent fetches, runs the extraction pipeline below, runs `nsync.py`, returns the schema-validated record, and its context (with the bodies) is discarded on return.
 
 Either path keeps the main loop holding only compact records, the manifest, and small local files — never tens of full page bodies. `.nsync/tmp/` is scratch space; clean it up at command end.
+
+**Mandatory `extract-body` gate (the canonical fetch→hash pipeline).** `notion-fetch` returns its markdown body wrapped inside an envelope (`<page url>`, `<ancestor-path>`, `<properties>`, `<content>…</content>`, `</page>`). Feeding the envelope directly to `hash --mode remote` or `normalize --mode remote` silently strips the body — the unknown-tag fallback removes the entire `<content>…</content>` span, and every page hashes to the preamble line. This caused mass false "stale" reports in plugin_version 0.1.x. The fix is: **always run `nsync.py extract-body` first.** Sub-agent prompts MUST instruct exactly this two-stage pipeline — never let the sub-agent invent its own body-extraction logic, because empirically different sub-agents will trim, dedent, drop the preamble, or include the wrapper in subtly different ways, producing five different hashes for the same page.
+
+The canonical commands (for both inline `<8` and Workflow `≥8` paths):
+
+```sh
+# 1. write the full notion-fetch text field verbatim — DO NOT trim or reformat
+echo "$NOTION_FETCH_TEXT_FIELD" > .nsync/tmp/<page_id>.fetch.txt
+
+# 2. extract the body, then hash; or extract and write a normalized snapshot
+python3 nsync.py extract-body .nsync/tmp/<page_id>.fetch.txt \
+  | python3 nsync.py hash --mode remote                      # → sha256:… for remote_hash
+
+python3 nsync.py extract-body .nsync/tmp/<page_id>.fetch.txt \
+  | python3 nsync.py normalize --mode remote \
+  > .nsync/snapshots/<page_id>.md                            # snapshot write
+
+# 3. clean up scratch
+rm .nsync/tmp/<page_id>.fetch.txt
+```
+
+`extract-body` is idempotent — piping it on a body that was already extracted (or a local file) returns the input unchanged. So sub-agents never need to detect "is this an envelope?" themselves: always extract, always hash. See `manifest-schema.md` → "Fetch-envelope extraction (`extract-body`)" for the full spec.
 
 **Note on `child_link_tags`.** Notion serializes `<page url>` URLs inconsistently — canonical (undashed 32-hex), HTML-escaped, bare URL, and the hybrid 8-4-rest-no-dashes form have all been observed in a single run. Never write inline URL→UUID regex in commands; pipe the tag list through `python3 nsync.py extract-uuids` (`manifest-schema.md` → "Compute helper") which is tolerant of all four forms and always emits canonical dashed UUIDs.
 

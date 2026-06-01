@@ -12,58 +12,75 @@ Read these references first:
 - @${CLAUDE_PLUGIN_ROOT}/references/notion-mcp-cheatsheet.md
 - @${CLAUDE_PLUGIN_ROOT}/references/sub-agent-schemas.md
 
-**Never hash, normalize, diff, or extract UUIDs in-context.** Run every hash / normalization / UUID extraction through `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py"` (see `references/manifest-schema.md` → "Compute helper"), and keep page bodies out of this command's context per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline".
+**All deterministic work runs through `nsync.py`.** Main-loop orchestration goes through the `pull-preflight` / `pull-classify` / `pull-apply` subcommands. Sub-agent per-page work goes through the `process-fetch` helper. Never write inline Python heredocs in this command; never hash, normalize, diff, or extract UUIDs directly in-context. The single allow-rule `Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py:*)` covers every Bash call this command makes.
 
 ## Steps
 
-1. Walk upward to locate `.nsync/`. If absent, abort: "Not a sync root. Run /nsync:init first."
-2. Load `.nsync/manifest.json` and `.nsync/ignore`. Compute the ignore matcher (gitignore syntax — shell out to `git check-ignore` if available, else use an inline matcher).
-3. **Backfill root `index.md` if missing.** Check whether `manifest.pages` has an entry keyed by `config.parent.page_id`. If absent:
-   - `fetch` the parent page; cache body to `.nsync/tmp/<parent_page_id>.remote.md`. Apply the markdown normalization pipeline via `nsync.py normalize --mode remote` (rich-block tags + `<empty-block/>` + unrecognized-tag fallback + image-block lines stripped; `<page url>` tags are SUBSTITUTED with child-link lines, not stripped, per `references/path-mapping.md` → "Child-link lines"). UUIDs for child-link substitution come from `nsync.py extract-uuids` (never an inline regex). For UUIDs in the manifest, render with the relative path. For UUIDs not in the manifest (children not yet enumerated), defer the substitution to step 7's regeneration pass.
-   - If the resulting body is **empty** per `references/path-mapping.md` → "Non-empty parent body" (zero-length after `strip()`, or only the `# <Title>` line): skip silently. No file, no PageRecord. (`<empty-block/>` is now stripped by the pipeline, so a Notion parent that holds only that block correctly hashes empty.)
-   - If **non-empty**: write `<sync-root>/index.md` with the substituted body. Write `.nsync/snapshots/<parent_page_id>.md` with the same content. Add the root PageRecord (`path: "index.md"`, `parent_page_id: null`, `has_children: true` if the parent has sub-pages else `false`, hashes computed over the normalized content, `last_synced_at` now, `local_ignored: false`, `rich_blocks` from detection). Persist the manifest. Surface in the output summary as `Root index.md created (backfill)`.
-4. Run rename detection per `references/path-mapping.md`. Apply user-confirmed renames to PageRecord paths BEFORE classifying state. (Rename detection already skips PageRecords with `parent_page_id: null` per the algorithm in `path-mapping.md`.)
-5. Glob `**/*.md` under sync root (scope = `.md` only, excluding `.nsync/` and ignored patterns). Recompute `local_hash` for every tracked file in one shot via `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" hash-batch --mode local`.
-6. Get every tracked page's fresh `remote_hash` **without holding bodies in context**, per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline" (skip `local_ignored: true`). ≥8 pages: dispatch via `Workflow` — one sub-agent per `NSYNC_READ_BATCH` batch, each returning `BatchReadRecords` validated against `references/sub-agent-schemas.md`. Inside each sub-agent: `notion-fetch` each page (emit all fetches in one assistant message → parallel), run `nsync.py hash --mode remote`, run `nsync.py extract-uuids` over the body to canonicalize the `<page url>` URLs into `child_link_tags`. <8 pages: run inline with process-and-discard. Honor the 429 backoff and report progress per "Progress reporting" (e.g. `Hashed 12/40 pages…`). Classify each page's state from its returned `remote_hash` per the hash-only table in `references/conflict-protocol.md`. The main loop keeps only the compact records — for the few pages that need a full remote body downstream (Auto-mergeable remote-only overwrite in "Per-state actions", and conflict resolution), re-fetch that single page on demand.
-7. Derive **reachability** from the data already in hand — never call `notion-search` for tree enumeration (it is relevance-ranked, not exhaustive; see `references/notion-mcp-cheatsheet.md` → "`notion-search` is NOT a tree-listing API"). `reachable = { parent's <page url> child UUIDs (from step 3's parent fetch — re-fetch if the manifest already had a root entry so step 3 was a no-op) } ∪ { each has_children record's child_link_tags UUIDs (from step 6) }`. Run every `<page url>` source through `python3 nsync.py extract-uuids` so hybrid / escaped / bare-URL forms all canonicalize. Detect:
-   - **Remote-added** = `reachable − manifest_pids` → mirror locally as new files (compute path, fetch body, write `.md` + snapshot, add PageRecord). Their bodies were not in the per-page hash fan-out; fetch each on demand here, but if more than 8 land in this list dispatch a second `Workflow` batch using the same `BatchReadRecords` schema.
-   - **Remote-trashed** = `manifest_pids − reachable − { config.parent.page_id }` → prompt the symmetric trash flow (delete local? keep as Added on next commit?). Record a `TrashEntry` with `trashed_by: "remote-trashed"` on choice. The root entry is special-cased and never trashed (`manifest-schema.md` → "Root PageRecord").
-8. **Regenerate child-link lines** for every PageRecord with `has_children: true` (including the root). Report progress per `references/notion-mcp-cheatsheet.md` → "Progress reporting" if this spans many files (e.g. `Regenerated child links: 5/18 index files…`). For each:
-   - Use the page's `child_link_tags` from its step-6 compact record (the ordered whole-line `<page url ...>` tags) — no body re-fetch needed. Run the tag list through `python3 nsync.py extract-uuids` so hybrid / escaped / bare URLs all yield canonical dashed UUIDs.
-   - Map those UUIDs to **expected** child-link lines (look up each target's local path in the manifest; render `external` if the UUID is absent).
-   - Scan the current local file for **existing** lines matching **either** the managed recognition regex or the placeholder regex in `references/path-mapping.md` → "Child-link lines".
-   - Apply the "Regeneration trigger" rules in `path-mapping.md` (reconcile **managed** lines only; leave **placeholder** lines exactly in place (they resolve at `/nsync:commit`, never here):
-     - `expected` == existing managed set byte-for-byte (and no placeholders) → no-op.
-     - any existing line present (managed or placeholder), mismatch → replace each existing **managed** line by UUID match (rewrites title text and target path from current manifest data); insert any newly-added expected lines after the last existing child-link line; drop orphaned existing **managed** lines whose UUID is no longer in `expected`. Placeholder lines are never UUID-matched, orphan-dropped, or reordered. The position of the first existing line stays put.
-     - no existing line at all (neither managed nor placeholder), `expected` non-empty (migration case) → if local non-child-link content (both regexes stripped) equals snapshot non-child-link content (no user prose edits), overwrite the local file with `remote_raw` after substituting `<page url>` tags with child-link lines (positions match Notion). Otherwise append all expected lines after the file's last non-empty line and surface `Added <N> child-link lines to <path>; reposition manually if desired.`
-   - Overwrite the snapshot to match the new local file. Recompute `local_hash` (and `remote_hash` if a body was re-fetched) via `nsync.py hash`; the strip rules make these stable so the manifest hashes are unchanged in steady state. Persist if anything moved.
+1. **Locate `.nsync/`.** Walk upward from the working directory. If absent, abort: "Not a sync root. Run /nsync:init first."
 
-## Per-state actions
+2. **Preflight.** One Bash call:
+   ```sh
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" pull-preflight \
+     --sync-root <sync-root> > .nsync/tmp/preflight.json
+   ```
+   This loads the manifest + ignore patterns, globs `**/*.md`, runs rename detection (skipping the root entry per `path-mapping.md` → "Root-page constraints"), hashes every tracked file, and builds the fetch list. Read the resulting JSON via the Read tool — it has fields `{schema_version, sync_root, parent, root_backfill_needed, rename_candidates, fetch_list, local_hashes, local_only_md_files, ignored_md_files, tracked_paths_missing}`.
 
-- **Clean** — refresh `last_synced_at` only. No file write, no hash change.
-- **Auto-mergeable (local-only)** — leave the file alone. No manifest change (local_hash already matches because it derives from the same content; only refresh `last_synced_at` for audit).
-- **Auto-mergeable (remote-only)** — re-fetch this single page's body (it was not retained in step 6), overwrite the local file with the normalized remote markdown (`nsync.py normalize --mode remote`). Refresh `local_hash`, `remote_hash` (`nsync.py hash`), snapshot (`.nsync/snapshots/<page_id>.md`), and `last_synced_at`.
-- **Conflict** — drive UX per `references/conflict-protocol.md`. The resolution choice determines what `local_hash`, `remote_hash`, and the snapshot become — follow the "Snapshot update after resolution" table in that reference exactly.
+3. **Apply rename confirmations.** For each entry in `rename_candidates`, AskUserQuestion `[Y]es / [N]o`. On `Y`, update the PageRecord's `path` (edit `manifest.json` via the Read+Write tools, or run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py pull-preflight ...` again after the manual edit). On `N`, the candidate becomes `Deleted (local)` + `Added (local)` per `path-mapping.md`. Re-run `pull-preflight` only if any rename was applied (regenerates `fetch_list` + `local_hashes` against the new paths).
 
-## Conflict UX (NEVER inject `<<<<<<<` markers)
+4. **Root backfill** (only if `preflight.root_backfill_needed` is true). `notion-fetch` the parent page; write the full `text` field to `.nsync/tmp/<parent_page_id>.fetch.txt` via the Write tool. Run via Bash:
+   ```sh
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" process-fetch \
+     .nsync/tmp/<parent_page_id>.fetch.txt \
+     --page-id <parent_page_id> --path index.md --has-children true \
+     --out-body .nsync/tmp/<parent_page_id>.body.md
+   ```
+   If the extracted body is empty per `path-mapping.md` → "Non-empty parent body", skip silently. Otherwise create the root PageRecord (the substitution + write happens in step 7 via `pull-apply`, so just add the manifest entry here with placeholder hashes — `pull-apply` will overwrite them).
 
-For each conflicting page, AskUserQuestion with options `[L]ocal`, `[R]emote`, `[E]dit`, `[S]kip`.
+5. **Fetch every tracked page's remote_hash via Workflow sub-agents** (skip `local_ignored: true`). Build `preflight.fetch_list`-derived batches of size `NSYNC_READ_BATCH = 4` (see `notion-mcp-cheatsheet.md` → "Concurrency"). Each sub-agent's per-page flow is **three tool calls**:
+   1. `mcp__claude_ai_Notion__notion-fetch`
+   2. `Write` the response `text` field verbatim to `.nsync/tmp/<page_id>.fetch.txt`
+   3. `Bash`: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" process-fetch .nsync/tmp/<page_id>.fetch.txt --page-id <id> --path <path> --has-children {true|false} --delete-fetch`
+   Each sub-agent returns a structured object validated against the `CompactReadRecord` schema in `references/sub-agent-schemas.md`. Aggregate all returned records into one JSON file (`.nsync/tmp/fetch_results.json`) shaped `{"records": [...]}`. Report progress per `notion-mcp-cheatsheet.md` → "Progress reporting".
 
-- `[E]dit` writes a scratch buffer to `.nsync/conflicts/<page_id>.scratch.md` containing three labeled sections (LOCAL / REMOTE / MERGED, with MERGED pre-filled as a best-guess merge). Ask the user to edit the MERGED section, confirm, then overwrite the real file with the MERGED content and remove the scratch file.
-- After each resolution, ask: "Continue with the next conflict, or stop and finish later?" Partial pulls are allowed; the manifest commits per-file after each resolution lands.
+6. **Classify.** One Bash call:
+   ```sh
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" pull-classify \
+     --preflight .nsync/tmp/preflight.json \
+     --records .nsync/tmp/fetch_results.json \
+     --parent-fetch .nsync/tmp/<parent_page_id>.fetch.txt \
+     > .nsync/tmp/classify.json
+   ```
+   Output JSON has `{clean, auto_merge_remote, auto_merge_local, conflict, remote_added, remote_trashed, refetch_list, child_link_regen_list}`. Read it. The `refetch_list` is exactly the set of pages whose body the next phase needs (Auto-merge-remote ∪ Conflict pages).
 
-## Atomicity
+7. **Conflict prompts (one batched AskUserQuestion).** If `classify.conflict` is non-empty, ask the user with one multi-question `AskUserQuestion` call — one question per conflicting file, options `[L]ocal / [R]emote / [E]dit / [S]kip`, per `conflict-protocol.md`. Build `.nsync/tmp/decisions.json` shaped `{"conflicts": [{page_id, choice, ...}]}`. For `[E]dit` choices, write the scratch buffer to `.nsync/conflicts/<page_id>.scratch.md` (per `conflict-protocol.md` → "Scratch buffer format"), wait for the user to edit, then confirm; once confirmed, copy the MERGED section over the real file before invoking `pull-apply`.
 
-Persist the manifest **once per batch/phase** (after each fetch batch's records are folded in, after the child-link regeneration pass, and after each conflict resolution), not after every single page. Snapshot files are written as their pages are processed. A pull that crashes or is aborted mid-way leaves a consistent state for the batches it already persisted. Clean up `.nsync/tmp/` at command end.
+8. **Refetch bodies for `classify.refetch_list`.** Same sub-agent pattern as step 5, but with one tweak: pass `--out-body .nsync/tmp/<page_id>.body.md` and `--delete-fetch` so each sub-agent's `process-fetch` leaves a body file behind for `pull-apply` to consume. Sub-agents return `PageOk` records (just `{page_id, ok}`) — main loop only needs to know all bodies landed.
+
+9. **Apply.** One Bash call:
+   ```sh
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" pull-apply \
+     --classify .nsync/tmp/classify.json \
+     --bodies-dir .nsync/tmp \
+     --decisions .nsync/tmp/decisions.json \
+     --cleanup-tmp \
+     > .nsync/tmp/apply_report.json
+   ```
+   `pull-apply` substitutes `<page url>` → child-link lines for has_children pages, normalizes, writes local files + snapshots, applies conflict resolutions per the snapshot-update table in `conflict-protocol.md`, regenerates child-link lines on Clean has_children pages, refreshes `last_synced_at`, persists the manifest atomically (`.tmp` → fsync → rename), verifies every local file's hash matches the manifest, and cleans up `.nsync/tmp/`.
+
+10. **Read the apply report and print the summary.** The JSON contains `{overwritten, overwrite_errors, conflict_applied, regen_changes, clean_refreshed, verify_mismatches, tmp_files_cleaned}`.
 
 ## Output
 
-Summary by section:
-- Auto-merged (remote-only changes pulled): file list
-- New local files created from remote-added pages
-- Child-link lines updated: list each affected `index.md` with the delta (added/removed/renamed)
-- Conflicts resolved: file + chosen resolution
-- Conflicts skipped: file list (these will reappear on next pull and block commit)
-- Remote-trashed handled: file list + disposition
+Print one section per relevant bucket from the apply report:
+- **Auto-merged (remote-only changes pulled):** `overwritten` file list
+- **New local files created from remote-added pages:** from the second-pass body mirror, if any
+- **Child-link lines updated:** `regen_changes` per `index.md` with `added` count
+- **Conflicts resolved:** `conflict_applied` (page + chosen resolution)
+- **Conflicts skipped:** entries in `classify.conflict` not present in `conflict_applied`
+- **Remote-trashed handled:** from the trash flow on `classify.remote_trashed`
 
 Suggest next step (`/nsync:commit` if local edits exist, `/nsync:status` otherwise).
+
+## Atomicity
+
+`pull-apply` persists the manifest in one atomic rename at the end of its run. If interrupted mid-orchestration, the manifest reflects only the state at the previous successful persist (the prior pull's terminal state). Re-running `/nsync:pull` resumes cleanly. Sub-agent body files in `.nsync/tmp/` are scratch — `pull-apply --cleanup-tmp` removes them; a crash leaves them harmless for next run's `process-fetch` to overwrite.

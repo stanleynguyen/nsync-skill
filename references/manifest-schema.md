@@ -17,7 +17,7 @@ Recommended `.gitignore` if the sync root lives in git: ignore `.nsync/snapshots
 ```json
 {
   "schema_version": 1,
-  "plugin_version": "0.2.1",
+  "plugin_version": "0.3.0",
   "parent": {
     "page_id": "fb1d8c3a-5e21-4f70-8a23-9c4b6d8e1f02",
     "url": "https://www.notion.so/workspace/My-Docs-fb1d8c3a5e214f708a239c4b6d8e1f02",
@@ -34,7 +34,7 @@ Written once by `/nsync:init`. Read-only after that — never mutated by other c
 ```json
 {
   "schema_version": 1,
-  "plugin_version": "0.2.1",
+  "plugin_version": "0.3.0",
   "parent": { "page_id": "...", "url": "...", "title": "..." },
   "pages": {
     "<page_uuid>": { /* PageRecord */ }
@@ -121,7 +121,7 @@ Entries are kept indefinitely. Volume stays low because trash events are rare.
 ```json
 {
   "schema_version": 1,
-  "plugin_version": "0.2.1",
+  "plugin_version": "0.3.0",
   "parent": {
     "page_id": "fb1d8c3a-5e21-4f70-8a23-9c4b6d8e1f02",
     "url": "https://www.notion.so/workspace/Docs-fb1d8c3a5e214f708a239c4b6d8e1f02",
@@ -200,6 +200,48 @@ CLI surface (FILE omitted or `-` reads stdin; `hash`/`normalize` take `--mode lo
 | `… hash-batch --mode {local\|remote}` | reads NUL- or newline-delimited paths on stdin; prints `<path>\t<sha256:hex>` per line — **one process call hashes a whole batch** |
 | `… normalize --mode {local\|remote} FILE` | the normalized markdown-only body (for snapshot writes / diff inputs) |
 | `… strip-childlinks FILE` | body with managed + placeholder child-link lines removed (commit's pre-diff strip) |
+| `… extract-uuids FILE` | one canonical dashed UUID per line, in occurrence order, for every `<page url>` tag or notion.so URL found (tolerant of all-dashed / undashed / partial-dashed / HTML-escaped forms) |
+| `… extract-body FILE` | pulls just the markdown body out of a `notion-fetch` text envelope — see "Fetch-envelope extraction" below. **Required input gate before `hash --mode remote` / `normalize --mode remote` on any `notion-fetch` output.** |
 | `… diff SNAPSHOT LOCAL` | unified diff snapshot→local with child-link lines stripped from both sides |
 
 The `sha256:` prefix is included in the output, matching the `local_hash` / `remote_hash` field format above — no string surgery needed before writing the manifest.
+
+## Fetch-envelope extraction (`extract-body`)
+
+`mcp__claude_ai_Notion__notion-fetch` returns a JSON-shaped response whose `text` field is an envelope, **not** raw markdown:
+
+```
+Here is the result of "view" for the Page with URL ... as of ...:
+<page url="..." [icon="..."]>
+<ancestor-path>
+<parent-page url="..." title="..."/>
+</ancestor-path>
+<properties>
+{"title":"..."}
+</properties>
+<content>
+{actual markdown body — possibly with rich-block tags, image lines, child <page url> refs}
+</content>
+</page>
+```
+
+Feeding this whole envelope to `hash --mode remote` or `normalize --mode remote` is wrong: the unknown-tag fallback in the normalization pipeline strips `<ancestor-path>`, `<properties>`, and `<content>` as paired spans **together with their inner contents** — so the markdown body inside `<content>...</content>` gets silently swallowed, and every page hashes to the SHA-256 of the preamble line (`Here is the result of "view"...`). This was the dominant source of false "stale" reports in plugin_version 0.1.x.
+
+The canonical pipeline for remote bodies is therefore a two-stage shell pipe — always use both stages in this order, never feed envelopes directly to hash/normalize:
+
+```sh
+# hash a notion-fetch envelope into remote_hash
+python3 nsync.py extract-body raw_envelope.txt \
+  | python3 nsync.py hash --mode remote
+```
+
+```sh
+# write a normalized snapshot from a notion-fetch envelope
+python3 nsync.py extract-body raw_envelope.txt \
+  | python3 nsync.py normalize --mode remote \
+  > .nsync/snapshots/<page_id>.md
+```
+
+`extract-body` is **idempotent**: input that has no `<content>` tag (e.g. an already-extracted body, or a local file) is echoed back unchanged. So piping through it twice, or running it on a bare body, is safe — there is no separate "is this an envelope?" check sub-agents need to perform.
+
+When a sub-agent stores the envelope on disk first (the process-and-discard pattern in `notion-mcp-cheatsheet.md` → "Fan-out threshold"), the convention is to write the envelope to `.nsync/tmp/<page_id>.fetch.txt` (full `text` field, verbatim) and the extracted body to `.nsync/tmp/<page_id>.remote.md`. Both are scratch — cleaned up at command end.

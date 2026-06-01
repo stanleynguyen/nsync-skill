@@ -6,59 +6,92 @@ allowed-tools: Read, Write, Glob, Bash, Task, Workflow, AskUserQuestion, mcp__cl
 
 Initialize the current working directory as an nsync sync root mirroring a Notion parent page tree.
 
-Read these references first — they hold the canonical rules and you must follow them exactly:
+Read these references first:
 - @${CLAUDE_PLUGIN_ROOT}/references/path-mapping.md
 - @${CLAUDE_PLUGIN_ROOT}/references/manifest-schema.md
 - @${CLAUDE_PLUGIN_ROOT}/references/notion-mcp-cheatsheet.md
 - @${CLAUDE_PLUGIN_ROOT}/references/sub-agent-schemas.md
 
-**Never hash, normalize, or extract UUIDs in-context.** Run every hash / normalization / UUID extraction through `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py"` (see `references/manifest-schema.md` → "Compute helper"), and keep page bodies out of this command's context per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline".
+**All deterministic work runs through `nsync.py`.** Sub-agent per-page work uses `process-fetch`. The frontier-expansion loop uses `enumerate-tree`. Never write inline Python heredocs.
 
 Input: `$1` may contain a Notion parent URL. If absent, ask the user for it via AskUserQuestion.
 
-## Preflight (run in order, fail fast with an actionable message)
+## Preflight (run in order, fail fast)
 
-1. Walk upward from CWD looking for any existing `.nsync/` directory. If found, abort with: "A sync root already exists at `<path>`. Run /nsync:status there, or pick a different directory."
+1. Walk upward from CWD for an existing `.nsync/`. If found, abort with: "A sync root already exists at `<path>`. Run /nsync:status there, or pick a different directory."
 2. List CWD. Anything other than `.git/` and `.gitignore` counts as existing content. If non-empty, AskUserQuestion with three options:
-   - "Initialize anyway and ignore existing files (they won't sync unless they match remote pages)"
+   - "Initialize anyway and ignore existing files"
    - "Clear and initialize (DELETES every file except .git/)"
    - "Abort" (default)
-   On "Clear", list every file and directory that would be removed and require a second confirmation. Never touch `.git/`.
-3. Parse the URL. Accept: `notion.so` URLs with a 32-hex page id, `*.notion.site` URLs with the same shape, or a raw UUID (with or without dashes). Reject URLs with `?v=`, `/collection`, or any database-shaped target.
-4. Smoke-test Notion connector connectivity: call `mcp__claude_ai_Notion__notion-search` with `{ "query": "_", "page_size": 1 }`. (Connectivity only — never used downstream for tree enumeration.) If the tool isn't registered, the user hasn't connected Notion yet — tell them: "Notion connector not installed. Open Claude Code → Settings → Connectors → Notion → Connect, then re-run /nsync:init." If the call returns an auth error, instead tell them their OAuth session has expired and they need to reconnect via the same path.
-5. Call `fetch` on the parsed UUID and map the response per `references/notion-mcp-cheatsheet.md` "Notion error mapping" table (404 / 403 / `<data-source>`).
+   On "Clear", list every file/dir that would be removed and require a second confirmation. Never touch `.git/`.
+3. Parse the URL. Accept `notion.so` URLs with a 32-hex page id, `*.notion.site` URLs same shape, or raw UUID (dashed/undashed). Reject `?v=`, `/collection`, database-shaped targets.
+4. Smoke-test connectivity: `mcp__claude_ai_Notion__notion-search` with `{query: "_", page_size: 1}`. Map error responses per `notion-mcp-cheatsheet.md` "Init preflight error mapping" table.
+5. `mcp__claude_ai_Notion__notion-fetch` the parsed UUID and map per the same table (404 / 403 / `<data-source>`).
 
 ## Initialize
 
 Once preflight passes:
 
-1. Capture parent page metadata (UUID, title, URL).
-2. Create `.nsync/` with:
-   - `config.json` — `{ schema_version: 1, plugin_version: "0.2.1", parent: { page_id, url, title }, created_at: <RFC3339 UTC> }`
-   - `manifest.json` — initial shell with parent populated, `pages: {}`, `trash_log: []`. Sorted-key, two-space-indented.
-   - `ignore` — copy the "Default ignore patterns" block from `references/path-mapping.md` verbatim.
-   - `snapshots/` — empty directory.
-3. Enumerate the parent's sub-page tree by **bottom-up traversal from the parent fetch**, never by `notion-search` (semantic search is relevance-ranked and not exhaustive — see `references/notion-mcp-cheatsheet.md` → "`notion-search` is NOT a tree-listing API"; on a 96-page tree it returns ~15). Start with `{ root: config.parent.page_id, frontier: [config.parent.page_id] }`. Repeat until the frontier is empty: fetch every page on the frontier (in `NSYNC_READ_BATCH`-sized parallel batches), pipe each body through `python3 nsync.py extract-uuids` to harvest its child UUIDs, add any unseen UUID to the next frontier and to the discovered set. Carry along each page's title (from the `<properties>` block) and parent UUID for the path map below. For large trees, report progress per `references/notion-mcp-cheatsheet.md` → "Progress reporting" (e.g. `Enumerating sub-tree… (87 pages so far)`). Hard safety cap at 500 pages.
-4. **Compute every local path first** (no extra fetches). From the discovered tree (step 3), compute each page's local path per `references/path-mapping.md` (slug + collision suffix + `index.md` for pages with children). Path computation uses only titles + parentage already harvested in step 3 — full UUID→path map is known before any body is re-fetched. Bodies fetched in step 3 are kept on disk as `.nsync/tmp/<page_id>.remote.md` for step 5's hashing pass; do NOT hold them in the main loop's context.
+1. Capture parent metadata (UUID, title, URL).
+2. Create `.nsync/`:
+   - `config.json` — `{schema_version: 1, plugin_version: "0.3.0", parent: {page_id, url, title}, created_at: <RFC3339>}`
+   - `manifest.json` — initial shell `{schema_version, plugin_version, parent, pages: {}, trash_log: []}`. Sorted-key, two-space-indented.
+   - `ignore` — copy "Default ignore patterns" block from `path-mapping.md` verbatim.
+   - `snapshots/`, `tmp/` — empty directories.
 
-5. **Mirror page bodies, keeping bodies out of this command's context** per `references/notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline". ≥8 pages: dispatch via `Workflow` — one sub-agent per `NSYNC_READ_BATCH` batch, passing each the UUID→path map from step 4. Each sub-agent returns one PageRecord per page, validated against the `CompactReadRecord` schema in `references/sub-agent-schemas.md` (init's per-page return is the same shape; `manifest_remote_hash` is omitted on first init). <8 pages: run inline with process-and-discard. Honor the 429 backoff and report progress per "Progress reporting" (e.g. `Mirrored 12/40 pages…`). The per-page work (done by the sub-agent, never in the main context):
-   - Read the cached body from `.nsync/tmp/<page_id>.remote.md` (already fetched in step 3); record rich-block presence in `rich_blocks` (type + coarse anchor + summary) per `references/manifest-schema.md`.
-   - **If the page has children** (`has_children: true`): for each whole-line `<page url ...>Title</page>` tag, substitute a child-link line per `references/path-mapping.md` → "Child-link lines" → "Format". Extract every URL through `python3 nsync.py extract-uuids` so hybrid/escaped/bare forms canonicalize identically, then look up the path in the UUID→path map. For tags whose UUID is NOT in the map (page outside the enumerated tree), render with the `external` flag and the full Notion URL; the line will be promoted to a relative link on the next `/nsync:pull`.
-   - Write the local `.md` file (use `nsync.py normalize --mode remote` for the body) and `.nsync/snapshots/<page_id>.md` with the same content.
-   - Return a PageRecord-shaped `CompactReadRecord` with `local_hash` / `remote_hash` from `nsync.py hash`, `last_synced_at` (now), `has_children`, `local_ignored: false`. Both hashes strip child-link lines and `<page url>` tags, so they're identical regardless of whether the file contains rendered child-link lines or none. (No `last_seen_remote_modified` field in v1 — hashes drive classification.)
-   - The main loop folds the returned PageRecords into the manifest and persists it **once per batch** (not per page).
-6. **Mirror the parent body if non-empty.** The parent body is already cached at `.nsync/tmp/<config.parent.page_id>.remote.md` from step 3. Run `python3 nsync.py normalize --mode remote` on it (`<empty-block/>` and any other unrecognized rich-block tag is stripped by the script — see `notion-mcp-cheatsheet.md` → rich-block list). Decide per `references/path-mapping.md` → "Non-empty parent body":
-   - **Empty** (zero-length after strip, or only a single `# <Title>` line): skip — no `index.md`, no root PageRecord. Note this in the output summary as "Parent body empty — no root index.md created".
-   - **Non-empty**: substitute each whole-line `<page url>` tag in the parent body with a child-link line (relative path from sync root; UUIDs extracted via `python3 nsync.py extract-uuids`, then looked up in the path map populated by step 4). Write the result to `<sync-root>/index.md`. Write `.nsync/snapshots/<parent_page_id>.md` with the same content. Add the **root PageRecord** keyed by `config.parent.page_id` with `path: "index.md"`, `parent_page_id: null`, `has_children: true` (assuming step 3 discovered any sub-page; else `false`), `local_hash` and `remote_hash` computed over the normalized content per the pipeline, `last_synced_at` (now), `local_ignored: false`, and any detected `rich_blocks`.
-7. Persist `manifest.json` (sorted-key, two-space-indented).
+3. **Enumerate the sub-tree, round-by-round.** Save the parent fetch to `.nsync/tmp/<parent_id>.fetch.txt` (you already have its body cached from preflight step 5; write the response `text` field verbatim). Then loop:
+   ```sh
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" enumerate-tree \
+     --fetches-dir .nsync/tmp \
+     > .nsync/tmp/frontier.json
+   ```
+   Read `frontier.json`. If `done: true`, the tree is fully enumerated. Otherwise, dispatch a Workflow batch to fetch every UUID in `next_round`: each sub-agent does **one tool call** (notion-fetch) per page and one Write to `.nsync/tmp/<page_id>.fetch.txt`. After the batch lands, re-run `enumerate-tree` — it now sees more cached fetches and emits the next frontier. Report progress per `notion-mcp-cheatsheet.md` → "Progress reporting" each round (e.g. `Enumerating sub-tree… (87 pages so far)`). Hard cap at 500 pages.
+
+4. **Compute the path map.** Read each cached fetch envelope inline (via Read tool), extract title from the `<properties>` block and parent UUID from `<ancestor-path>`, then compute the full UUID→path map per `path-mapping.md` (slug + collision suffix + `index.md` for has_children). Path computation uses only titles + parentage — no body re-fetch needed. Persist the manifest with placeholder PageRecords (path, parent_page_id, title, url, has_children, empty hashes).
+
+5. **Mirror page bodies via Workflow sub-agents.** For each cached fetch, dispatch sub-agents in batches of `NSYNC_READ_BATCH = 4`. Each sub-agent's per-page flow is **one Bash call**:
+   ```sh
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" process-fetch \
+     .nsync/tmp/<page_id>.fetch.txt \
+     --page-id <id> --path <path> --has-children {true|false} \
+     --out-body .nsync/tmp/<page_id>.body.md \
+     --out-snapshot .nsync/snapshots/<page_id>.md \
+     --delete-fetch
+   ```
+   Sub-agent returns `{page_id, remote_hash, child_link_tags}`.
+
+6. **Apply via `pull-apply`.** The init flow's post-fetch work — substituting `<page url>` → child-link lines for has_children pages, writing local files, computing local_hashes — is identical to `pull-apply`'s remote-only overwrite branch. Build a synthetic classify JSON that lists every fetched page as `auto_merge_remote`:
+   ```json
+   {
+     "sync_root": "<sync-root>",
+     "clean": [],
+     "auto_merge_remote": [...all pids...],
+     "auto_merge_local": [],
+     "conflict": [],
+     "remote_added": [],
+     "remote_trashed": [],
+     "refetch_list": [{"page_id": "...", "path": "...", "has_children": ..., "reason": "auto_merge_remote"}, ...],
+     "child_link_regen_list": []
+   }
+   ```
+   Then:
+   ```sh
+   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" pull-apply \
+     --classify .nsync/tmp/classify.json \
+     --bodies-dir .nsync/tmp \
+     --cleanup-tmp \
+     > .nsync/tmp/apply_report.json
+   ```
+
+7. **Root body** — handle the parent's own body. Run `process-fetch` on `.nsync/tmp/<parent_id>.fetch.txt` with `--out-body .nsync/tmp/<parent_id>.body.md`. If the body is non-empty per `path-mapping.md` → "Non-empty parent body" (check by running `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" normalize --mode remote .nsync/tmp/<parent_id>.body.md` and inspecting), include the parent in the classify JSON as a root entry (`page_id: <parent_id>`, `path: "index.md"`, `has_children: true|false`). `pull-apply` writes `index.md` + the root snapshot + the root PageRecord.
 
 ## Output
 
-Print a short summary:
-- Parent page title and URL
-- Whether the root `index.md` was created (and why not, if skipped — empty parent body)
-- Count of pages mirrored (excluding the root entry to avoid double counting; or call them out separately)
-- Count of rich blocks detected (preserved, not synced) — grouped by type
-- Any pages that failed to fetch, with the underlying error per page
+Short summary:
+- Parent page title + URL
+- Root `index.md` created? (or skipped because parent body was empty)
+- Page count mirrored
+- Rich-block count by type
+- Any pages that failed (page_id + error)
 
 Suggest: "Run /nsync:status to verify the working tree is clean."
