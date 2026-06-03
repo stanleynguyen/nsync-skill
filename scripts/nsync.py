@@ -43,9 +43,11 @@ FILE omitted (or "-") reads stdin.
 import argparse
 import difflib
 import hashlib
+import html as _html_mod
 import re
 import sys
 import unicodedata
+from html.parser import HTMLParser
 
 # --- Regexes transcribed verbatim from the references --------------------------
 
@@ -166,8 +168,314 @@ def _warn_strip_unknown(text):
     return text
 
 
-def normalize(raw_bytes, mode):
-    """Apply the manifest-schema.md hash pipeline. mode is 'local' or 'remote'."""
+# ----------------------------------------------------------------------------
+# Notion serialization-quirks canonicalization. See references/notion-serialization-
+# quirks.md. Notion's `notion-fetch` returns a deterministically MUTATED form of
+# whatever markdown was sent on create/update (HTML tables, escaped specials,
+# collapsed inter-block blanks, autolinked bare URLs, inferred code-fence langs,
+# escaped brackets, page-title H1 stripped). This step reduces both sides to a
+# common canonical form so local_hash and remote_hash compare meaningfully.
+# Applied symmetrically in both modes — Cat 4-7 inside prose only (fence-aware).
+# ----------------------------------------------------------------------------
+
+# CommonMark-escapable punctuation set, intersected with chars Notion has been
+# observed to over-escape on fetch (`$`, `~`, `[`, `]`). Backslash-unescaping any
+# char in this set is safe: CommonMark renders `\<c>` and `<c>` identically for
+# these chars. Kept as a literal-char character class.
+_NOISE_ESCAPABLE = r'$~#|*_`{}()>+\-.!\[\]'
+_ESCAPE_RE = re.compile(r'\\([' + _NOISE_ESCAPABLE + r'])')
+
+# Autolink unwrap: `[<URL>](<URL>)` where label is byte-identical to the
+# target, the URL has an http(s)/mailto scheme, and contains no `)` or `]` in
+# path. Conservative — URLs with parens stay as-is.
+_AUTOLINK_RE = re.compile(
+    r'\[((?:https?|mailto):[^\s\]\)]+)\]\(\1\)'
+)
+
+# Bare-domain autolink unwrap: Notion takes bare text like `Sync.com` in body
+# and wraps it as `[Sync.com](http://Sync.com)` (or https://) on fetch. The
+# label is NOT byte-identical to the target — it lacks the scheme. Detect the
+# pattern where target = scheme + "://" + label, and the label has no
+# whitespace, brackets, or parens. Conservative: only fires for http/https
+# (not mailto, since mailto targets are always `mailto:user@host` and the
+# bare form `user@host` wouldn't naturally appear as link text).
+_BARE_DOMAIN_AUTOLINK_RE = re.compile(
+    r'\[([^\s\]\)]+)\]\(https?://\1\)'
+)
+
+# Code-fence language hint: ` ```<lang>` on the fence-open line, where <lang> is
+# a single word (letters/digits/underscore/+/-). Strip the lang token only,
+# keep the fence backticks. Applied at whole-doc scope (the line-anchored
+# regex won't accidentally match a fence-close because closes have no lang).
+_FENCE_LANG_RE = re.compile(
+    r'^(\s*```)[a-zA-Z0-9_+\-]+\s*$', re.MULTILINE
+)
+
+# Blank-line collapse (prose-only): collapse any run of 2+ newlines to a single
+# `\n`. Notion stores adjacent blocks with single `\n` (no blank line); local
+# files typically have `\n\n` (blank line between paragraphs). To make both
+# sides hash-equal we drop blank-line separators entirely inside prose. Block-
+# separation semantics for rendering are preserved on disk — only the canonical
+# hash input collapses them. Inside fenced code, blank lines are preserved
+# verbatim (the fence-aware segmenter applies this only to prose segments).
+_BLANK_RUN_RE = re.compile(r'\n{2,}')
+
+# MD pipe-table separator row canonicalization. Author-shorthand `|---|---|`
+# and the pretty form `| --- | --- |` (which the HTML-table -> pipe converter
+# emits) must hash equal. Match a whole separator line and re-emit each cell
+# trimmed-and-padded with single spaces. Alignment markers (:---, ---:, :---:)
+# are preserved.
+_TABLE_SEPARATOR_RE = re.compile(
+    r'^[ \t]*\|([ \t]*:?-+:?[ \t]*\|)+[ \t]*$', re.MULTILINE
+)
+
+
+def _canonicalize_table_separator(text):
+    """Normalize MD pipe-table separator rows to `| --- | ---: | :---: | ... |`
+    form (single space padding, alignment markers preserved). Operates on
+    prose text after fenced code has been sentinelized so it won't touch
+    backtick-shell-pipe lines inside code."""
+    def _norm_line(match):
+        line = match.group(0).strip()
+        # Drop leading and trailing `|`, split on `|`.
+        inner = line[1:-1] if line.startswith('|') and line.endswith('|') else line
+        cells = inner.split('|')
+        out_cells = []
+        for cell in cells:
+            cell = cell.strip()
+            # Preserve alignment markers verbatim; replace dash content with
+            # exactly three dashes.
+            left = ':' if cell.startswith(':') else ''
+            right = ':' if cell.endswith(':') else ''
+            out_cells.append(left + '---' + right)
+        return '| ' + ' | '.join(out_cells) + ' |'
+    return _TABLE_SEPARATOR_RE.sub(_norm_line, text)
+
+
+# Fenced code block matcher. Greedy-by-line: opens at a line starting with ```
+# (with optional lang), closes at the next line starting with ```. The lang
+# token is stripped on the open line for category 6. The body is preserved
+# verbatim — sentinelized during prose transforms and restored afterwards.
+_FENCED_CODE_BLOCK_RE = re.compile(
+    r'(^[ \t]{0,3}```)([a-zA-Z0-9_+\-]*)[ \t]*\n(.*?)(^[ \t]{0,3}```[ \t]*$)',
+    re.DOTALL | re.MULTILINE,
+)
+_SENTINEL_TPL = '\x00NSYNC_CODE_BLOCK_{}\x00'
+
+
+def _extract_code_blocks(text):
+    """Extract every fenced code block, replace each with a sentinel, and
+    return (sentinelized_text, [block_strings_in_order]). The block strings
+    include the fence-open (with lang already stripped per category 6) and
+    fence-close lines and the body verbatim. Caller restores via
+    _restore_code_blocks. This keeps prose transforms (escape/autolink/
+    blank-line collapse) from touching code content."""
+    blocks = []
+
+    def repl(match):
+        open_fence = match.group(1)  # e.g. "```"
+        # Category 6: lang token already absorbed into match.group(2); we just
+        # drop it here, keeping only the bare ```.
+        body = match.group(3)
+        close_fence = match.group(4)
+        # Canonical fenced block: open + \n + body (verbatim) + close (without
+        # any trailing whitespace).
+        canonical = open_fence + '\n' + body + close_fence.rstrip()
+        blocks.append(canonical)
+        return _SENTINEL_TPL.format(len(blocks) - 1)
+
+    sentinelized = _FENCED_CODE_BLOCK_RE.sub(repl, text)
+    return sentinelized, blocks
+
+
+def _restore_code_blocks(text, blocks):
+    for i, block in enumerate(blocks):
+        text = text.replace(_SENTINEL_TPL.format(i), block)
+    return text
+
+
+def _canonicalize_prose(text):
+    """Apply cat 3 (blank-line collapse) + cat 4 (escapes incl brackets cat 7)
+    + cat 5 (autolink) + MD-table separator normalization to prose text.
+    Called on sentinelized text after code blocks have been replaced with
+    placeholders — so transforms can't touch code content."""
+    # MD pipe-table separator row canonicalization — symmetric on both sides
+    # so `|---|---|` (author shorthand) and `| --- | --- |` (HTML-table
+    # converter output) hash equal.
+    text = _canonicalize_table_separator(text)
+    # Cat 4 + 7: strip backslash before chars in the escapable set.
+    text = _ESCAPE_RE.sub(r'\1', text)
+    # Cat 5: autolink unwrap. Run both the byte-identical and bare-domain
+    # variants. Order matters: bare-domain first because the byte-identical
+    # variant wouldn't match `[Sync.com](http://Sync.com)`.
+    text = _BARE_DOMAIN_AUTOLINK_RE.sub(r'\1', text)
+    text = _AUTOLINK_RE.sub(r'\1', text)
+    # Cat 3: blank-line collapse — any run of 2+ newlines -> single `\n`.
+    text = _BLANK_RUN_RE.sub('\n', text)
+    return text
+
+
+class _NotionTableParser(HTMLParser):
+    """Minimal HTML-table parser used to canonicalize <table>...</table> spans
+    into markdown pipe-table form. Bails on rowspan/colspan/unknown nesting —
+    caller falls back to leaving the span verbatim and emits a one-time warn.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows = []          # list[list[str]]
+        self.current_row = None
+        self.current_cell = None
+        self.has_header = False
+        self.bailed = False
+        self.depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        attrs_d = dict(attrs)
+        if tag in ("rowspan", "colspan"):
+            self.bailed = True
+            return
+        if tag == 'table':
+            self.depth += 1
+            if self.depth > 1:
+                self.bailed = True
+        elif tag in ('thead',):
+            self.has_header = True
+        elif tag == 'tr':
+            self.current_row = []
+        elif tag in ('th', 'td'):
+            if 'rowspan' in attrs_d or 'colspan' in attrs_d:
+                self.bailed = True
+            self.current_cell = []
+        # colgroup/col/tbody/tfoot: ignore (don't affect rendering).
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == 'table':
+            self.depth -= 1
+        elif tag == 'tr':
+            if self.current_row is not None:
+                self.rows.append(self.current_row)
+                self.current_row = None
+        elif tag in ('th', 'td'):
+            if self.current_cell is not None and self.current_row is not None:
+                cell_text = ''.join(self.current_cell).strip().replace('\n', ' ')
+                # Escape `|` inside cells so the pipe-table parses unambiguously.
+                cell_text = cell_text.replace('|', r'\|')
+                self.current_row.append(cell_text)
+            self.current_cell = None
+
+    def handle_data(self, data):
+        if self.current_cell is not None:
+            self.current_cell.append(data)
+
+
+def _canonicalize_table(html_str):
+    """Convert a <table>...</table> HTML span to markdown pipe form.
+    Returns (canonical_string, ok). On ok=False, caller leaves verbatim.
+    """
+    p = _NotionTableParser()
+    try:
+        p.feed(html_str)
+        p.close()
+    except Exception:
+        return html_str, False
+    if p.bailed or not p.rows:
+        return html_str, False
+    # Make sure every row has the same column count; else bail.
+    width = max(len(r) for r in p.rows)
+    if any(len(r) != width for r in p.rows):
+        return html_str, False
+    # Header row = first row. If no <thead>, still treat first row as header
+    # (markdown pipe-table requires a header).
+    header = p.rows[0]
+    body = p.rows[1:]
+    lines = []
+    lines.append('| ' + ' | '.join(header) + ' |')
+    lines.append('| ' + ' | '.join(['---'] * width) + ' |')
+    for r in body:
+        lines.append('| ' + ' | '.join(r) + ' |')
+    return '\n'.join(lines) + '\n', True
+
+
+_TABLE_SPAN_RE = re.compile(
+    r'<table\b[^>]*>.*?</table>', re.DOTALL | re.IGNORECASE
+)
+
+
+def _canonicalize_tables(text):
+    """Replace every <table> span with its canonical pipe-table form.
+    On parse-bail for a given table, leave that span verbatim and warn once."""
+    def repl(match):
+        canonical, ok = _canonicalize_table(match.group(0))
+        if not ok:
+            if 'table-rowspan-or-nested' not in _UNKNOWN_TAG_WARNED:
+                sys.stderr.write(
+                    "nsync: warning: leaving <table> with rowspan/colspan/"
+                    "nested-table verbatim (canonicalization bailed)\n"
+                )
+                _UNKNOWN_TAG_WARNED.add('table-rowspan-or-nested')
+            return match.group(0)
+        return canonical
+    return _TABLE_SPAN_RE.sub(repl, text)
+
+
+def _strip_h1_title(text, expected_title):
+    """Cat 1: if expected_title is set and the first non-blank line is exactly
+    `# <expected_title>` (CommonMark ATX H1, optional trailing whitespace),
+    strip that line plus any immediately-following blank line. Case-sensitive
+    exact match on title. No-op when expected_title is None or mismatched."""
+    if not expected_title:
+        return text
+    lines = text.split('\n')
+    # Find first non-blank line.
+    i = 0
+    while i < len(lines) and lines[i].strip() == '':
+        i += 1
+    if i >= len(lines):
+        return text
+    # ATX H1 with optional leading space (CommonMark allows up to 3 leading
+    # spaces). Trailing whitespace allowed; trailing `#`s NOT supported
+    # (would need closing-sequence rules from CommonMark §4.2; rare in practice).
+    m = re.match(r'^[ ]{0,3}#[ \t]+(.+?)[ \t]*$', lines[i])
+    if not m:
+        return text
+    if m.group(1) != expected_title:
+        return text
+    # Drop the H1 line. Also drop one immediately-following blank line so the
+    # body doesn't start with a stray blank.
+    del lines[i]
+    if i < len(lines) and lines[i].strip() == '':
+        del lines[i]
+    return '\n'.join(lines)
+
+
+def _canonicalize_notion_noise(text, expected_title=None):
+    """The single entry-point for round-trip noise canonicalization. Apply
+    every category symmetrically (both modes call this). Order:
+    1. H1 page-title strip (whole-doc).
+    2. HTML <table> -> pipe-table (whole-doc; before code extraction because
+       tables contain HTML, not fenced code).
+    3. Pull every fenced code block out behind sentinels (the extractor also
+       applies category 6 — language hint strip — as part of restoration).
+    4. Apply prose transforms (cats 3 + 4 + 5 + 7) on the sentinelized text.
+    5. Restore code blocks.
+    """
+    text = _strip_h1_title(text, expected_title)
+    text = _canonicalize_tables(text)
+    sentinelized, blocks = _extract_code_blocks(text)
+    sentinelized = _canonicalize_prose(sentinelized)
+    text = _restore_code_blocks(sentinelized, blocks)
+    return text
+
+
+def normalize(raw_bytes, mode, expected_title=None):
+    """Apply the manifest-schema.md hash pipeline. mode is 'local' or 'remote'.
+
+    `expected_title` is an optional page-title hint used by category 1 (H1
+    page-title strip). When None, H1 strip is a no-op — callers that don't yet
+    have the title pass None and the existing behavior is preserved."""
     # 1. UTF-8 decode.
     text = raw_bytes.decode("utf-8")
     # 2. NFC unicode normalization.
@@ -188,6 +496,13 @@ def normalize(raw_bytes, mode):
     # 7. both modes: strip whole-line <page url ...>...</page> spans.
     text = PAGE_SPAN_RE.sub('', text)
     text = PAGE_SELFCLOSE_RE.sub('', text)
+
+    # 8. both modes: Notion serialization-quirks canonicalization. Reverses
+    # the deterministic mutations Notion applies on round-trip (HTML tables,
+    # escaped specials, collapsed blanks, autolinked URLs, inferred fence
+    # languages, escaped brackets, optional page-title H1 strip). See
+    # references/notion-serialization-quirks.md.
+    text = _canonicalize_notion_noise(text, expected_title=expected_title)
 
     # Line pass: 4. strip trailing whitespace per line; drop whole-line image blocks
     # (remote), child-link managed + placeholder lines (both), and any residual
@@ -237,7 +552,11 @@ def strip_childlinks(raw_bytes):
 # from sub-agent records — Notion serializes the same UUID in inconsistent forms
 # (canonical undashed, dashed, HTML-escaped, hybrid 8-4-rest, bare URL).
 _URL_OR_TAG_RE = re.compile(
-    r'(?:notion\.so|notion\.site)/(?:[a-zA-Z0-9_\-]*?-)?([0-9a-fA-F][0-9a-fA-F\-]{31,40})',
+    # Hosts: notion.so / notion.site (legacy), notion.com / app.notion.com (current).
+    # Path prefix: optional "p/" (new form, `app.notion.com/p/<uuid>`) OR optional
+    # slug-tail ending in `-` (old form, `notion.so/<slug>-<uuid>`). Either may be
+    # absent for the bare `notion.so/<uuid>` form.
+    r'notion\.(?:so|site|com)/(?:p/)?(?:[a-zA-Z0-9_\-]*?-)?([0-9a-fA-F][0-9a-fA-F\-]{31,40})',
 )
 
 
@@ -291,10 +610,88 @@ CONTENT_BODY_RE = re.compile(
 
 def extract_body(raw_bytes):
     text = raw_bytes.decode("utf-8")
+    text = _recover_mangled_envelope(text)
     match = CONTENT_BODY_RE.search(text)
     if match is None:
         return text
     return match.group(1)
+
+
+# Defensive recovery for two well-observed sub-agent serialization failures.
+# Both produce a file whose <content>...</content> body is JSON-escape-encoded
+# (`\n` two-char sequences instead of real newlines, `\"` instead of `"`, etc.),
+# which makes SHA-256 of the extracted body non-deterministic across sub-agents
+# and produces persistent false-stale `/nsync:status` reports.
+#
+#   Failure 1: sub-agent ran `cat > file << 'EOF'` with the FULL MCP JSON result
+#              ({"metadata":..., "title":..., "text":"...envelope with \n..."}).
+#              The heredoc preserves backslash-n / backslash-quote literals.
+#
+#   Failure 2: sub-agent piped the `.text` value through `echo` or json.dumps()
+#              before writing. Same outcome.
+#
+# Both recoverable. Apply BEFORE the <content> regex runs.
+def _recover_mangled_envelope(text):
+    # JSON-wrapper case: input is the whole tool-result JSON. Pull out .text.
+    stripped = text.lstrip()
+    if stripped.startswith("{") and '"text"' in stripped[:512]:
+        import json as _json
+        try:
+            obj = _json.loads(stripped)
+            if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+                return obj["text"]
+        except Exception:
+            pass  # not valid JSON; fall through
+
+    # Escape-mangled envelope: <page>, <content> tags present at start of LITERAL
+    # backslash-n sequences instead of real newlines. Heuristic: input contains
+    # >=5 literal `\n` sequences AND <=1 real newline (in the first 2 KB to
+    # avoid scanning huge bodies). Decode unicode_escape to recover.
+    sample = text[:2048]
+    if sample.count("\\n") >= 5 and sample.count("\n") <= 1:
+        import codecs as _codecs
+        try:
+            return _codecs.decode(text, "unicode_escape")
+        except Exception:
+            pass  # malformed escapes; keep original
+
+    return text
+
+
+# <properties>{"title":"..."}</properties> envelope title extractor. Returns the
+# title string or None if absent / unparseable. Used by callers that thread the
+# title into normalize() for the H1 strip (category 1) in
+# _canonicalize_notion_noise. Idempotent on already-extracted bodies (returns
+# None when no <properties> tag is present).
+_PROPERTIES_BLOCK_RE = re.compile(
+    r'<properties>\s*(\{.*?\})\s*</properties>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def extract_title(raw_bytes):
+    """Pull the page title out of the <properties>{"title":"..."}</properties>
+    block of a notion-fetch envelope. Returns None if not found or unparseable.
+    """
+    text = raw_bytes.decode("utf-8", errors="replace")
+    m = _PROPERTIES_BLOCK_RE.search(text)
+    if m is None:
+        return None
+    import json as _json
+    try:
+        props = _json.loads(m.group(1))
+    except Exception:
+        return None
+    title = props.get("title") if isinstance(props, dict) else None
+    if isinstance(title, str):
+        return title
+    return None
+
+
+def extract_body_with_title(raw_bytes):
+    """Convenience pairing of extract_body + extract_title from the same envelope.
+    Returns (body_text, title_or_None)."""
+    return extract_body(raw_bytes), extract_title(raw_bytes)
 
 
 def sha256_of(text):
@@ -479,14 +876,22 @@ def detect_renames(manifest, local_paths, sync_root):
     return candidates
 
 
-def hash_batch_local(sync_root, paths):
-    """Compute local_hash for each path. Returns {path: sha256:hex}."""
+def hash_batch_local(sync_root, paths, title_by_path=None):
+    """Compute local_hash for each path. Returns {path: sha256:hex}.
+
+    `title_by_path` is an optional mapping {rel_path: page_title} used to thread
+    the H1-strip hint (category 1) into normalize. When absent, H1 strip is a
+    no-op — existing-call-site behavior preserved."""
     out = {}
+    title_by_path = title_by_path or {}
     for rel in paths:
         full = os.path.join(sync_root, rel)
         try:
             with open(full, "rb") as fh:
-                out[rel] = sha256_of(normalize(fh.read(), "local"))
+                out[rel] = sha256_of(normalize(
+                    fh.read(), "local",
+                    expected_title=title_by_path.get(rel),
+                ))
         except OSError as exc:
             out[rel] = "ERROR:" + str(exc)
     return out
@@ -533,13 +938,16 @@ def cmd_process_fetch(args):
     raw = _read(args.fetch_file)
     body = extract_body(raw)
     body_bytes = body.encode("utf-8")
+    # Title threads into normalize() for category 1 (H1 page-title strip). The
+    # envelope's <properties>{"title":"..."}</properties> is authoritative.
+    title = extract_title(raw)
     if args.out_body:
         with open(args.out_body, "w") as fh:
             fh.write(body)
     if args.out_snapshot:
         with open(args.out_snapshot, "w") as fh:
-            fh.write(normalize(body_bytes, "remote"))
-    remote_hash = sha256_of(normalize(body_bytes, "remote"))
+            fh.write(normalize(body_bytes, "remote", expected_title=title))
+    remote_hash = sha256_of(normalize(body_bytes, "remote", expected_title=title))
     uuids = extract_uuids(body_bytes)
     if args.delete_fetch and args.fetch_file != "-":
         try:
@@ -555,6 +963,8 @@ def cmd_process_fetch(args):
         rec["has_children"] = (args.has_children == "true")
     if args.path:
         rec["path"] = args.path
+    if title is not None:
+        rec["title"] = title
     _json_out(rec)
     return 0
 
@@ -683,7 +1093,8 @@ def cmd_process_postwrite(args):
     raw_fetch = _read(args.fetch_file)
     body = extract_body(raw_fetch)
     body_bytes = body.encode("utf-8")
-    normalized = normalize(body_bytes, "remote")
+    title = extract_title(raw_fetch)
+    normalized = normalize(body_bytes, "remote", expected_title=title)
     new_remote_hash = sha256_of(normalized)
     with open(args.snapshot_out, "w") as fh:
         fh.write(normalized)
@@ -731,7 +1142,13 @@ def cmd_pull_preflight(args):
     to_hash = [rec["path"] for pid, rec in manifest["pages"].items()
                if not rec.get("local_ignored", False)
                and rec["path"] in set(local_md)]
-    local_hashes = hash_batch_local(sync_root, to_hash)
+    # Title hint per path so normalize() can strip the H1 page-title line if
+    # present (category 1). When a manifest entry has no title, the dict lookup
+    # returns None and the strip is a no-op.
+    title_by_path = {rec["path"]: rec.get("title") or None
+                     for pid, rec in manifest["pages"].items()
+                     if not rec.get("local_ignored", False)}
+    local_hashes = hash_batch_local(sync_root, to_hash, title_by_path)
 
     # Fetch list: every tracked, non-ignored page (root inclusive)
     fetch_list = []
@@ -970,15 +1387,16 @@ def cmd_pull_apply(args):
             raw_body = fh.read()
         rendered = (substitute_page_urls(raw_body, path, path_by_pid)
                     if has_children else raw_body)
-        local_content = normalize(rendered.encode("utf-8"), "local")
+        title = title_by_pid.get(pid) or None
+        local_content = normalize(rendered.encode("utf-8"), "local", expected_title=title)
         target = os.path.join(sync_root, path)
         os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
         with open(target, "w") as fh:
             fh.write(local_content)
-        snap_content = normalize(raw_body.encode("utf-8"), "remote")
+        snap_content = normalize(raw_body.encode("utf-8"), "remote", expected_title=title)
         with open(os.path.join(snap_dir, f"{pid}.md"), "w") as fh:
             fh.write(snap_content)
-        new_local_hash = sha256_of(normalize(local_content.encode("utf-8"), "local"))
+        new_local_hash = sha256_of(normalize(local_content.encode("utf-8"), "local", expected_title=title))
         new_remote_hash = sha256_of(snap_content)
         rec = manifest["pages"][pid]
         rec["local_hash"] = new_local_hash
@@ -995,11 +1413,12 @@ def cmd_pull_apply(args):
         rec = manifest["pages"][pid]
         path = rec["path"]
         body_path = os.path.join(bodies_dir, f"{pid}.body.md")
+        title = title_by_pid.get(pid) or None
         if choice == "L":
             # Keep local; snapshot ← local; both hashes = hash(local)
             with open(os.path.join(sync_root, path)) as fh:
                 lc = fh.read()
-            lh = sha256_of(normalize(lc.encode("utf-8"), "local"))
+            lh = sha256_of(normalize(lc.encode("utf-8"), "local", expected_title=title))
             with open(os.path.join(snap_dir, f"{pid}.md"), "w") as fh:
                 fh.write(lc)
             rec["local_hash"] = lh
@@ -1014,13 +1433,13 @@ def cmd_pull_apply(args):
             has_children = rec["has_children"]
             rendered = (substitute_page_urls(rb, path, path_by_pid)
                         if has_children else rb)
-            lc = normalize(rendered.encode("utf-8"), "local")
+            lc = normalize(rendered.encode("utf-8"), "local", expected_title=title)
             with open(os.path.join(sync_root, path), "w") as fh:
                 fh.write(lc)
-            sc = normalize(rb.encode("utf-8"), "remote")
+            sc = normalize(rb.encode("utf-8"), "remote", expected_title=title)
             with open(os.path.join(snap_dir, f"{pid}.md"), "w") as fh:
                 fh.write(sc)
-            rec["local_hash"] = sha256_of(normalize(lc.encode("utf-8"), "local"))
+            rec["local_hash"] = sha256_of(normalize(lc.encode("utf-8"), "local", expected_title=title))
             rec["remote_hash"] = sha256_of(sc)
             rec["last_synced_at"] = now
         elif choice == "E":
@@ -1029,10 +1448,10 @@ def cmd_pull_apply(args):
                 lc = fh.read()
             with open(body_path) as fh:
                 rb = fh.read()
-            sc = normalize(rb.encode("utf-8"), "remote")
+            sc = normalize(rb.encode("utf-8"), "remote", expected_title=title)
             with open(os.path.join(snap_dir, f"{pid}.md"), "w") as fh:
                 fh.write(sc)
-            rec["local_hash"] = sha256_of(normalize(lc.encode("utf-8"), "local"))
+            rec["local_hash"] = sha256_of(normalize(lc.encode("utf-8"), "local", expected_title=title))
             rec["remote_hash"] = sha256_of(sc)
             rec["last_synced_at"] = now
         else:
@@ -1052,16 +1471,17 @@ def cmd_pull_apply(args):
             text, path, entry["expected_uuids"], path_by_pid, title_by_pid,
         )
         if changed:
-            new_text_norm = normalize(new_text.encode("utf-8"), "local")
+            title = title_by_pid.get(pid) or None
+            new_text_norm = normalize(new_text.encode("utf-8"), "local", expected_title=title)
             with open(target, "w") as fh:
                 fh.write(new_text_norm)
             # Snapshot: re-normalize stripped body
             stripped = strip_childlinks(new_text_norm.encode("utf-8"))
-            sc = normalize(stripped.encode("utf-8"), "local")
+            sc = normalize(stripped.encode("utf-8"), "local", expected_title=title)
             with open(os.path.join(snap_dir, f"{pid}.md"), "w") as fh:
                 fh.write(sc)
             rec = manifest["pages"][pid]
-            rec["local_hash"] = sha256_of(normalize(new_text_norm.encode("utf-8"), "local"))
+            rec["local_hash"] = sha256_of(normalize(new_text_norm.encode("utf-8"), "local", expected_title=title))
             rec["last_synced_at"] = now
             regen_changes.append({"page_id": pid, "path": path, "added": added})
 
@@ -1088,8 +1508,9 @@ def cmd_pull_apply(args):
         full = os.path.join(sync_root, rec["path"])
         if not os.path.exists(full):
             continue
+        title = rec.get("title") or None
         with open(full, "rb") as fh:
-            h = sha256_of(normalize(fh.read(), "local"))
+            h = sha256_of(normalize(fh.read(), "local", expected_title=title))
         if h != rec["local_hash"]:
             mismatches.append({"page_id": pid, "path": rec["path"],
                                 "manifest": rec["local_hash"], "actual": h})
@@ -1139,7 +1560,13 @@ def cmd_status_scan(args):
     to_hash = [rec["path"] for pid, rec in manifest["pages"].items()
                if not rec.get("local_ignored", False)
                and rec["path"] in set(local_md)]
-    local_hashes = hash_batch_local(sync_root, to_hash)
+    # Title hint per path so normalize() can strip the H1 page-title line if
+    # present (category 1). When a manifest entry has no title, the dict lookup
+    # returns None and the strip is a no-op.
+    title_by_path = {rec["path"]: rec.get("title") or None
+                     for pid, rec in manifest["pages"].items()
+                     if not rec.get("local_ignored", False)}
+    local_hashes = hash_batch_local(sync_root, to_hash, title_by_path)
 
     records = []
     if args.records and os.path.exists(args.records):
@@ -1276,7 +1703,13 @@ def cmd_commit_preflight(args):
     to_hash = [rec["path"] for pid, rec in manifest["pages"].items()
                if not rec.get("local_ignored", False)
                and rec["path"] in set(local_md)]
-    local_hashes = hash_batch_local(sync_root, to_hash)
+    # Title hint per path so normalize() can strip the H1 page-title line if
+    # present (category 1). When a manifest entry has no title, the dict lookup
+    # returns None and the strip is a no-op.
+    title_by_path = {rec["path"]: rec.get("title") or None
+                     for pid, rec in manifest["pages"].items()
+                     if not rec.get("local_ignored", False)}
+    local_hashes = hash_batch_local(sync_root, to_hash, title_by_path)
 
     modified, deleted = [], []
     for pid, rec in manifest["pages"].items():
@@ -1403,8 +1836,9 @@ def cmd_commit_apply(args):
         # Recompute local_hash from disk
         full = os.path.join(sync_root, rec["path"])
         if os.path.exists(full):
+            title = rec.get("title") or None
             with open(full, "rb") as fh:
-                rec["local_hash"] = sha256_of(normalize(fh.read(), "local"))
+                rec["local_hash"] = sha256_of(normalize(fh.read(), "local", expected_title=title))
         rec["last_synced_at"] = now
         updated.append(rec["path"])
 
@@ -1493,13 +1927,14 @@ def cmd_commit_apply(args):
             changed = True
         if changed:
             new_text = "\n".join(new_lines)
-            new_text = normalize(new_text.encode("utf-8"), "local")
+            title = rec.get("title") or None
+            new_text = normalize(new_text.encode("utf-8"), "local", expected_title=title)
             with open(full, "w") as fh:
                 fh.write(new_text)
             with open(os.path.join(snap_dir, f"{pid}.md"), "w") as fh:
                 stripped = strip_childlinks(new_text.encode("utf-8"))
-                fh.write(normalize(stripped.encode("utf-8"), "local"))
-            rec["local_hash"] = sha256_of(normalize(new_text.encode("utf-8"), "local"))
+                fh.write(normalize(stripped.encode("utf-8"), "local", expected_title=title))
+            rec["local_hash"] = sha256_of(normalize(new_text.encode("utf-8"), "local", expected_title=title))
             backfilled.append(rec["path"])
 
     save_manifest_atomic(sync_root, manifest)
@@ -1511,8 +1946,9 @@ def cmd_commit_apply(args):
         full = os.path.join(sync_root, rec["path"])
         if not os.path.exists(full):
             continue
+        title = rec.get("title") or None
         with open(full, "rb") as fh:
-            h = sha256_of(normalize(fh.read(), "local"))
+            h = sha256_of(normalize(fh.read(), "local", expected_title=title))
         if h != rec["local_hash"]:
             mismatches.append({"page_id": pid, "path": rec["path"]})
 
@@ -1561,7 +1997,7 @@ def _self_test():
     _UNKNOWN_TAG_WARNED.clear()
     body = b'before\n<frobnicator color="x">inner</frobnicator>\nafter\n'
     out = normalize(body, "remote")
-    expect("unknown <frobnicator> stripped", out, "before\n\nafter\n")
+    expect("unknown <frobnicator> stripped", out, "before\nafter\n")
     if "frobnicator" not in _UNKNOWN_TAG_WARNED:
         failures.append("unknown <frobnicator> should have warned")
 
@@ -1569,11 +2005,11 @@ def _self_test():
     _UNKNOWN_TAG_WARNED.clear()
     body = b'before\n<custom-widget data="x"/>\nafter\n'
     out = normalize(body, "remote")
-    expect("unknown <custom-widget/> stripped", out, "before\n\nafter\n")
+    expect("unknown <custom-widget/> stripped", out, "before\nafter\n")
 
     # 4. recognized rich block stripped (callout, multi-line).
     body = b'a\n<callout icon="i">\ninside\n</callout>\nb\n'
-    expect("callout span removed", normalize(body, "remote"), "a\n\nb\n")
+    expect("callout span removed", normalize(body, "remote"), "a\nb\n")
 
     # 5. local mode preserves rich blocks (only strips child-links + page urls).
     body = b'<callout>x</callout>\n[Title](./c.md) <!-- nsync:child page_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" -->\nbody\n'
@@ -1618,7 +2054,7 @@ def _self_test():
     # line. That's pre-existing behavior and matches what /nsync:pull's hash math
     # expects.
     body = b'a\n<page url="https://www.notion.so/abc">child</page>\nb\n'
-    expect("page url line removed (local)", normalize(body, "local"), "a\n\nb\n")
+    expect("page url line removed (local)", normalize(body, "local"), "a\nb\n")
 
     # 11. CRLF -> LF.
     body = b'x\r\ny\r\n'
@@ -1770,6 +2206,122 @@ def _self_test():
     expect("extract_uuids: canonicalize raw URL",
            extract_uuids(b"https://www.notion.so/abcdef1234567890abcdef1234567890"),
            ["abcdef12-3456-7890-abcd-ef1234567890"])
+
+    # ========================================================================
+    # 27-38. Notion serialization-quirks canonicalization. See references/notion-
+    # serialization-quirks.md. Each category gets a positive case + (where
+    # applicable) a no-op / false-positive case. The final XR test exercises the
+    # full pipeline on a fixture mixing every category.
+    # ========================================================================
+
+    # T1: H1 page-title strip — explicit title match.
+    expect("T1: H1 strip when title matches (remote)",
+           normalize(b"# My Page\n\nbody text\n", "remote", expected_title="My Page"),
+           "body text\n")
+    expect("T1: H1 strip when title matches (local)",
+           normalize(b"# My Page\n\nbody text\n", "local", expected_title="My Page"),
+           "body text\n")
+    # T1b: no title -> no strip (blank line still collapses per cat 3)
+    expect("T1b: H1 untouched when expected_title is None",
+           normalize(b"# My Page\n\nbody\n", "remote", expected_title=None),
+           "# My Page\nbody\n")
+    # T1c: title mismatch -> no strip (blank line still collapses per cat 3)
+    expect("T1c: H1 untouched when title mismatches",
+           normalize(b"# Other Heading\n\nbody\n", "remote", expected_title="My Page"),
+           "# Other Heading\nbody\n")
+
+    # T2: HTML <table> -> markdown pipe-table
+    table_html = (b"<table><tr><th>a</th><th>b</th></tr>"
+                  b"<tr><td>1</td><td>2</td></tr>"
+                  b"<tr><td>3</td><td>4</td></tr></table>\n")
+    expected_pipe = "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n"
+    expect("T2: HTML table -> pipe form",
+           normalize(table_html, "remote"),
+           expected_pipe)
+    # T2b: rowspan/colspan -> verbatim (parser bails)
+    table_rowspan = b'<table><tr><td rowspan="2">a</td><td>b</td></tr><tr><td>c</td></tr></table>\n'
+    out = normalize(table_rowspan, "remote")
+    if "<table>" not in out:
+        failures.append("T2b: rowspan table should be left verbatim, got %r" % out)
+
+    # T3: blank-line collapse (runs of 2+ -> single `\n`; canonical drops all
+    # blank-line separators so local `\n\n` and remote `\n` adjacencies match)
+    expect("T3: blank-line collapse to single newline",
+           normalize(b"para1\n\n\n\npara2\n", "local"),
+           "para1\npara2\n")
+
+    # T4: backslash-escape strip (outside code) — incl. brackets (cat 7)
+    expect("T4: strip \\$ \\~ \\[ \\]",
+           normalize(b"price \\$5 ~\\~ tilde and \\[12:34\\] mark\n", "local"),
+           "price $5 ~~ tilde and [12:34] mark\n")
+    # T4b: backslash inside fenced code is preserved verbatim
+    fence_body = b"```\n\\$ literal in code\n```\n"
+    out = normalize(fence_body, "local")
+    if "\\$" not in out:
+        failures.append("T4b: backslash inside fence should be preserved, got %r" % out)
+
+    # T5: autolink unwrap — `[<URL>](<URL>)` -> `<URL>`
+    expect("T5: autolink unwrap (https)",
+           normalize(b"see [https://x.com](https://x.com) for details\n", "local"),
+           "see https://x.com for details\n")
+    # T5b: non-matching label/target stays as-is
+    expect("T5b: regular link untouched",
+           normalize(b"see [click](https://x.com) for details\n", "local"),
+           "see [click](https://x.com) for details\n")
+
+    # T6: code-fence language hint strip
+    expect("T6: fence lang strip",
+           normalize(b"```javascript\nfoo()\n```\n", "local"),
+           "```\nfoo()\n```\n")
+
+    # T7: bracket-escape strip (subsumed by T4 escape set but a dedicated case
+    # documents intent).
+    expect("T7: bracket escape strip",
+           normalize(b"\\[timestamp\\] line\n", "local"),
+           "[timestamp] line\n")
+
+    # XR: cross-cutting round-trip parity. The same content authored as the
+    # local form vs Notion's serialized form must hash to the same SHA-256
+    # under matching expected_title.
+    local_form = (
+        b"# My Page\n\n"
+        b"Visit https://example.com for details.\n\n"
+        b"See [00:42] timestamp.\n\n"
+        b"| col1 | col2 |\n"
+        b"| --- | --- |\n"
+        b"| $5 | ~10 |\n\n"
+        b"```\nfoo()\n```\n"
+    )
+    remote_form = (
+        b"Visit [https://example.com](https://example.com) for details.\n"
+        b"\n"
+        b"See \\[00:42\\] timestamp.\n"
+        b"\n"
+        b"<table><tr><th>col1</th><th>col2</th></tr>"
+        b"<tr><td>\\$5</td><td>\\~10</td></tr></table>\n"
+        b"```python\nfoo()\n```\n"
+    )
+    h_local = sha256_of(normalize(local_form, "local", expected_title="My Page"))
+    h_remote = sha256_of(normalize(remote_form, "remote", expected_title="My Page"))
+    if h_local != h_remote:
+        failures.append(
+            "XR: local/remote round-trip parity failed\n"
+            "  local:  %s\n  remote: %s\n  local_norm:  %r\n  remote_norm: %r" % (
+                h_local, h_remote,
+                normalize(local_form, "local", expected_title="My Page"),
+                normalize(remote_form, "remote", expected_title="My Page"),
+            )
+        )
+
+    # extract_title smoke test
+    env_with_title = (
+        b'<page url="x"><properties>{"title":"Hello World"}</properties>'
+        b'<content>\nbody\n</content></page>\n'
+    )
+    expect("extract_title: pulls title from properties",
+           extract_title(env_with_title), "Hello World")
+    expect("extract_title: missing properties -> None",
+           extract_title(b"<page><content>x</content></page>"), None)
 
     if failures:
         sys.stderr.write("SELF-TEST FAILURES:\n" + "\n".join(failures) + "\n")

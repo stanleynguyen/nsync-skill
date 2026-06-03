@@ -76,13 +76,18 @@ Either path keeps the main loop holding only compact records, the manifest, and 
 
 **Mandatory `extract-body` gate (the canonical fetch→hash pipeline).** `notion-fetch` returns its markdown body wrapped inside an envelope (`<page url>`, `<ancestor-path>`, `<properties>`, `<content>…</content>`, `</page>`). Feeding the envelope directly to `hash --mode remote` or `normalize --mode remote` silently strips the body — the unknown-tag fallback removes the entire `<content>…</content>` span, and every page hashes to the preamble line. This caused mass false "stale" reports in plugin_version 0.1.x. The fix is: **always run `nsync.py extract-body` first.** Sub-agent prompts MUST instruct exactly this two-stage pipeline — never let the sub-agent invent its own body-extraction logic, because empirically different sub-agents will trim, dedent, drop the preamble, or include the wrapper in subtly different ways, producing five different hashes for the same page.
 
-The canonical commands (for both inline `<8` and Workflow `≥8` paths):
+The canonical pipeline (for both inline `<8` and Workflow `≥8` paths):
 
-```sh
-# 1. write the full notion-fetch text field verbatim — DO NOT trim or reformat
-echo "$NOTION_FETCH_TEXT_FIELD" > .nsync/tmp/<page_id>.fetch.txt
+1. **Write the `text` field via the `Write` tool, NOT via Bash.** The `text` value is a string with real newlines, real quotes, real backslashes. The `Write` tool's `content` parameter accepts that string and writes it raw — no escaping, no quoting. `cat > file << 'EOF'` heredoc or `echo "$VAR"` are forbidden: empirically, sub-agents that reach for Bash here end up writing either the **entire MCP JSON response** (`{"metadata":..., "text":"...envelope..."}`) or a string with shell-escaped `\n` / `\"` literals. Both produce a file whose extracted body hashes to a stable-but-wrong SHA-256, which then surfaces as persistent false-stale reports across `/nsync:status` runs. See `references/sub-agent-body-escape-drift.md` for the empirical failure.
+2. **Extract + hash + (optionally) snapshot via `nsync.py`.** `extract-body` defensively recovers from the two known mangling failures (whole-JSON wrapper, escape-mangled `\n` literals) — see the note in "Fetch-envelope extraction" in `manifest-schema.md` — but the recovery exists as a safety net, not a license to write mangled files on purpose.
+3. **Delete the scratch file** when done (or pass `--delete-fetch` to `process-fetch`).
 
-# 2. extract the body, then hash; or extract and write a normalized snapshot
+```text
+# 1. Write tool call (not Bash):
+#    Write({ file_path: ".nsync/tmp/<page_id>.fetch.txt",
+#            content: <the response's .text field, as a raw string> })
+
+# 2. Bash:
 python3 nsync.py extract-body .nsync/tmp/<page_id>.fetch.txt \
   | python3 nsync.py hash --mode remote                      # → sha256:… for remote_hash
 
@@ -90,13 +95,19 @@ python3 nsync.py extract-body .nsync/tmp/<page_id>.fetch.txt \
   | python3 nsync.py normalize --mode remote \
   > .nsync/snapshots/<page_id>.md                            # snapshot write
 
-# 3. clean up scratch
+# 3. Bash:
 rm .nsync/tmp/<page_id>.fetch.txt
 ```
 
+The `process-fetch` helper bundles steps 2-3 into one Bash call — that is the production path; the raw `extract-body | hash` pipe above is the spec view.
+
 `extract-body` is idempotent — piping it on a body that was already extracted (or a local file) returns the input unchanged. So sub-agents never need to detect "is this an envelope?" themselves: always extract, always hash. See `manifest-schema.md` → "Fetch-envelope extraction (`extract-body`)" for the full spec.
 
-**Note on `child_link_tags`.** Notion serializes `<page url>` URLs inconsistently — canonical (undashed 32-hex), HTML-escaped, bare URL, and the hybrid 8-4-rest-no-dashes form have all been observed in a single run. Never write inline URL→UUID regex in commands; pipe the tag list through `python3 nsync.py extract-uuids` (`manifest-schema.md` → "Compute helper") which is tolerant of all four forms and always emits canonical dashed UUIDs.
+**Note on `child_link_tags`.** Notion serializes `<page url>` URLs inconsistently across two axes:
+- **Host.** Mix of `notion.so`, `notion.site`, `notion.com`, and `app.notion.com`. The `app.notion.com/p/<uuid>` form became dominant for child-page tags somewhere around 2026-05; nsync.py before that point only matched `notion.so` / `notion.site` and silently returned empty arrays for every new-style URL, breaking reachability and rename detection.
+- **UUID encoding.** Canonical (undashed 32-hex), HTML-escaped (`&quot;` etc.), bare URL, and the hybrid 8-4-rest-no-dashes form have all been observed in a single run.
+
+Never write inline URL→UUID regex in commands; pipe the tag list through `python3 nsync.py extract-uuids` (`manifest-schema.md` → "Compute helper") which is tolerant of all hosts + all encodings and always emits canonical dashed UUIDs. If you add a new host form to the regex, add a test case in the smoke-test at the top of `references/sub-agent-body-escape-drift.md`.
 
 ## Markdown normalization (hash pipeline)
 
@@ -109,6 +120,7 @@ Both `local_hash` and `remote_hash` are SHA-256 over content processed through:
 5. Single trailing newline (no extra blank lines at EOF).
 6. For `remote_hash` only: strip every enhanced-markdown rich-block tag and its contents (see tag list below).
 7. **Both sides**: strip whole-line `<page url ...>...</page>` tags AND whole-line nsync child-link lines AND whole-line placeholder child-link lines (both regexes below). The `<page url>` strip catches what Notion serializes; the child-link / placeholder strip catches what nsync renders locally (managed lines plus user-authored placeholders awaiting commit-time backfill). Together they ensure child adds/removes/renames/reorders and pending placeholders never move either hash.
+8. **Both sides**: Notion serialization-quirks canonicalization. Reverses the deterministic mutations Notion applies on round-trip — HTML `<table>` ↔ MD pipe-table, MD pipe-table separator row normalization, code-fence language hint strip, backslash-escape strip (outside code), autolink unwrap (both byte-identical and bare-domain variants), blank-line collapse (prose-only), and optional H1 page-title strip (when caller passes `expected_title`). See `notion-serialization-quirks.md` for the full catalog with empirical examples. This is the step that makes 99 false-stale `/nsync:status` reports disappear when local files have authored-MD-pipe-tables / plain `$` / blank lines but Notion's fetch returns HTML-tables / `\$` / collapsed blanks.
 
 ### Child-link line regex (case-insensitive, anchored)
 

@@ -17,7 +17,7 @@ Recommended `.gitignore` if the sync root lives in git: ignore `.nsync/snapshots
 ```json
 {
   "schema_version": 1,
-  "plugin_version": "0.3.0",
+  "plugin_version": "0.3.1",
   "parent": {
     "page_id": "fb1d8c3a-5e21-4f70-8a23-9c4b6d8e1f02",
     "url": "https://www.notion.so/workspace/My-Docs-fb1d8c3a5e214f708a239c4b6d8e1f02",
@@ -34,7 +34,7 @@ Written once by `/nsync:init`. Read-only after that — never mutated by other c
 ```json
 {
   "schema_version": 1,
-  "plugin_version": "0.3.0",
+  "plugin_version": "0.3.1",
   "parent": { "page_id": "...", "url": "...", "title": "..." },
   "pages": {
     "<page_uuid>": { /* PageRecord */ }
@@ -121,7 +121,7 @@ Entries are kept indefinitely. Volume stays low because trash events are rare.
 ```json
 {
   "schema_version": 1,
-  "plugin_version": "0.3.0",
+  "plugin_version": "0.3.1",
   "parent": {
     "page_id": "fb1d8c3a-5e21-4f70-8a23-9c4b6d8e1f02",
     "url": "https://www.notion.so/workspace/Docs-fb1d8c3a5e214f708a239c4b6d8e1f02",
@@ -184,6 +184,16 @@ Apply identically to local file bytes and remote markdown bodies before SHA-256:
 5. Ensure exactly one trailing newline (no extra blank lines at EOF).
 6. For `remote_hash` only: strip enhanced-markdown rich-block tags and their contents. See `notion-mcp-cheatsheet.md` for the full tag list. Image-block lines (markdown-syntax) are stripped here too.
 7. **Both `remote_hash` and `local_hash`**: strip every whole-line `<page url ...>...</page>` tag AND every line matching the **child-link regex** OR the **placeholder child-link regex** in `path-mapping.md` → "Child-link lines". This is symmetric on both sides: the `<page url>` strip catches the remote form (what Notion serializes), and the child-link / placeholder strip catches the local forms (what nsync renders into `index.md`, plus user-authored placeholders awaiting commit-time backfill). Together they make child adds, removes, renames, reorders, and pending placeholders invisible to both hashes, so parent pages don't churn when children change.
+8. **Both `remote_hash` and `local_hash`**: Notion serialization-quirks canonicalization. Notion's `notion-fetch` deterministically mutates whatever markdown was sent on create/update; this step reverses the mutations so both sides reduce to a common canonical form. See `notion-serialization-quirks.md` for the full catalog. Categories applied:
+   - **H1 page-title strip** (when an `expected_title` hint is passed by the caller): drop a leading `# <title>\n` plus immediately-following blank line.
+   - **HTML `<table>` → MD pipe-table** (parser-bail on rowspan/colspan/nested).
+   - **Pipe-table separator row normalization** to `| --- | --- |` form (alignment markers `:---` / `---:` / `:---:` preserved).
+   - **Code-fence language hint strip** (` ```python ` → ` ``` `; preserves fence boundaries, on-disk file unchanged).
+   - **Backslash-escape strip** outside fenced code: `\$`, `\~`, `\[`, `\]`, and the rest of the CommonMark-escapable set (`\#`, `\|`, `\*`, `\_`, `` \` ``, `\{`, `\}`, `\(`, `\)`, `\>`, `\+`, `\-`, `\.`, `\!`). Inside fenced code, escapes are preserved verbatim.
+   - **Autolink unwrap**: `[<URL>](<URL>)` → `<URL>` (byte-identical label/target); plus the bare-domain variant `[<text>](https?://<text>)` → `<text>`.
+   - **Blank-line collapse** (prose-only): any run of 2+ newlines → single `\n`. Inside fenced code, blanks are preserved.
+
+`normalize()` accepts an optional `expected_title` argument used by step 8's H1 strip. Callers that have the page title (e.g., from the manifest entry or the fetched `<properties>{"title":"..."}</properties>` block) pass it through; callers without title pass `None` and the H1 strip is a no-op (safe fallback). See `notion-serialization-quirks.md` for the rationale and risk analysis.
 
 Both implementations (one for `local_hash`, one for `remote_hash`) must produce byte-identical output on byte-identical inputs. If a discrepancy is suspected during debugging, log both the canonicalized text and the hash alongside the conflict report.
 
@@ -200,7 +210,7 @@ CLI surface (FILE omitted or `-` reads stdin; `hash`/`normalize` take `--mode lo
 | `… hash-batch --mode {local\|remote}` | reads NUL- or newline-delimited paths on stdin; prints `<path>\t<sha256:hex>` per line — **one process call hashes a whole batch** |
 | `… normalize --mode {local\|remote} FILE` | the normalized markdown-only body (for snapshot writes / diff inputs) |
 | `… strip-childlinks FILE` | body with managed + placeholder child-link lines removed (commit's pre-diff strip) |
-| `… extract-uuids FILE` | one canonical dashed UUID per line, in occurrence order, for every `<page url>` tag or notion.so URL found (tolerant of all-dashed / undashed / partial-dashed / HTML-escaped forms) |
+| `… extract-uuids FILE` | one canonical dashed UUID per line, in occurrence order, for every `<page url>` tag or Notion URL found. Tolerant of host (`notion.so`, `notion.site`, `notion.com` / `app.notion.com`), path (`/p/<uuid>` new form or `/<slug>-<uuid>` legacy form), UUID encoding (all-dashed, undashed, partial-dashed, hybrid 8-4-rest-no-dashes), and HTML escapes (`&lt;`, `&quot;`, `&amp;`). Notion silently migrated child-page `<page url>` references from `www.notion.so/...` to `app.notion.com/p/...` somewhere around 2026-05; pre-fix nsync.py emitted empty `child_link_tags` on every new-style URL, breaking reachability in `/nsync:status` and rename detection in `/nsync:commit`. |
 | `… extract-body FILE` | pulls just the markdown body out of a `notion-fetch` text envelope — see "Fetch-envelope extraction" below. **Required input gate before `hash --mode remote` / `normalize --mode remote` on any `notion-fetch` output.** |
 | `… diff SNAPSHOT LOCAL` | unified diff snapshot→local with child-link lines stripped from both sides |
 
@@ -243,5 +253,11 @@ python3 nsync.py extract-body raw_envelope.txt \
 ```
 
 `extract-body` is **idempotent**: input that has no `<content>` tag (e.g. an already-extracted body, or a local file) is echoed back unchanged. So piping through it twice, or running it on a bare body, is safe — there is no separate "is this an envelope?" check sub-agents need to perform.
+
+`extract-body` also **silently recovers from two sub-agent serialization failures** before the `<content>` regex runs:
+1. **Whole-JSON-wrapper case.** Input starts with `{` and `"text"` appears in the first 512 bytes → parse as JSON, use `.text`. This catches the sub-agent that dumps the entire MCP tool result instead of just the `.text` field.
+2. **Escape-mangled case.** First 2 KB contain ≥5 literal `\n` (backslash-n) sequences and ≤1 real newline → `codecs.decode(text, 'unicode_escape')` the whole input. This catches the sub-agent that piped `.text` through `cat > file << 'EOF'` or `echo "$VAR"` and ended up with JSON-encoded escapes baked into the file.
+
+Both recoveries are idempotent on clean envelopes (clean envelopes don't start with `{`, and clean envelopes have many real newlines). The clean path is unchanged. See `references/sub-agent-body-escape-drift.md` for the empirical failure that prompted these defenses.
 
 When a sub-agent stores the envelope on disk first (the process-and-discard pattern in `notion-mcp-cheatsheet.md` → "Fan-out threshold"), the convention is to write the envelope to `.nsync/tmp/<page_id>.fetch.txt` (full `text` field, verbatim) and the extracted body to `.nsync/tmp/<page_id>.remote.md`. Both are scratch — cleaned up at command end.

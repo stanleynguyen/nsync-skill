@@ -31,7 +31,7 @@ Input: `$ARGUMENTS` contains zero or more positional path arguments. Each arg is
 
 3. **Fetch remote bodies for non-clean targets via Workflow sub-agents.** Each sub-agent's per-page flow is **three tool calls**:
    1. `mcp__claude_ai_Notion__notion-fetch`
-   2. `Write` the response `text` field verbatim to `.nsync/tmp/<page_id>.fetch.txt`
+   2. Use the `Write` **tool** (not Bash) to save the response's `.text` field to `.nsync/tmp/<page_id>.fetch.txt`. The `.text` value is a raw string with real newlines; pass it directly as `content`. **Forbidden:** Bash `cat > file << 'EOF'` heredoc, `echo "$VAR" >`, or any shell-mediated write — they mangle escapes and produce stable-but-wrong hashes (see `references/sub-agent-body-escape-drift.md`).
    3. `Bash`: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" process-fetch .nsync/tmp/<page_id>.fetch.txt --page-id <id> --path <path> --has-children {true|false} --out-body .nsync/tmp/<page_id>.body.md --delete-fetch`
 
    The `--out-body` flag writes the extracted body for the main loop to diff against the local file. Sub-agents return `{page_id, remote_hash, child_link_tags}` — the main loop reads the bodies from disk, not from sub-agent return values, so per-page context stays clean.

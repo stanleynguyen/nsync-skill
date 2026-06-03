@@ -38,7 +38,7 @@ Read these references first:
 
 5. **Fetch every tracked page's remote_hash via Workflow sub-agents** (skip `local_ignored: true`). Build `preflight.fetch_list`-derived batches of size `NSYNC_READ_BATCH = 4` (see `notion-mcp-cheatsheet.md` → "Concurrency"). Each sub-agent's per-page flow is **three tool calls**:
    1. `mcp__claude_ai_Notion__notion-fetch`
-   2. `Write` the response `text` field verbatim to `.nsync/tmp/<page_id>.fetch.txt`
+   2. Use the `Write` **tool** (not Bash) to save the response's `.text` field to `.nsync/tmp/<page_id>.fetch.txt`. The `.text` value is a raw string with real newlines; pass it directly as `content`. **Forbidden:** Bash `cat > file << 'EOF'` heredoc, `echo "$VAR" >`, or any shell-mediated write — they mangle escapes and produce stable-but-wrong hashes (see `references/sub-agent-body-escape-drift.md`).
    3. `Bash`: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" process-fetch .nsync/tmp/<page_id>.fetch.txt --page-id <id> --path <path> --has-children {true|false} --delete-fetch`
    Each sub-agent returns a structured object validated against the `CompactReadRecord` schema in `references/sub-agent-schemas.md`. Aggregate all returned records into one JSON file (`.nsync/tmp/fetch_results.json`) shaped `{"records": [...]}`. Report progress per `notion-mcp-cheatsheet.md` → "Progress reporting".
 

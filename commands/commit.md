@@ -32,7 +32,7 @@ Input: `$ARGUMENTS` may contain `--force <path>` (repeatable). Parse them out be
 
 4. **Workspace-wide staleness check via Workflow sub-agents** (skip pages in `--force` set). For `preflight.stale_check_list`, dispatch sub-agents in batches of `NSYNC_READ_BATCH = 4`. Each sub-agent's per-page flow:
    1. `mcp__claude_ai_Notion__notion-fetch`
-   2. `Write` the response `text` field to `.nsync/tmp/<page_id>.fetch.txt`
+   2. Use the `Write` **tool** (not Bash) to save the response's `.text` field to `.nsync/tmp/<page_id>.fetch.txt`. Pass the `.text` value (a raw string with real newlines) as `content`. **Forbidden:** Bash `cat > file << 'EOF'` heredoc, `echo "$VAR" >`, or any shell-mediated write. Those mangle escapes and produce stable-but-wrong hashes (see `references/sub-agent-body-escape-drift.md`).
    3. `Bash`: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" process-fetch .nsync/tmp/<page_id>.fetch.txt --page-id <id> --path <path> --has-children {true|false} --out-body .nsync/tmp/<page_id>.body.md`
    (Note: keep the body file — the next phase needs it for hunk-build. Do NOT pass `--delete-fetch` here; the fetch envelope is deleted at end-of-command via the `--cleanup-tmp` flag in `commit-apply`.)
 
@@ -60,7 +60,7 @@ Input: `$ARGUMENTS` may contain `--force <path>` (repeatable). Parse them out be
    1. Read the validated hunks for this page from `.nsync/tmp/hunks.json` (filtered by user choices).
    2. `mcp__claude_ai_Notion__notion-update-page` with `command="update_content"`, `content_updates=<hunks>`.
    3. `mcp__claude_ai_Notion__notion-fetch` again (re-fetch).
-   4. `Write` the new `text` field to `.nsync/tmp/<page_id>.postwrite.fetch.txt`.
+   4. Use the `Write` **tool** (not Bash) to save the re-fetch's `.text` field to `.nsync/tmp/<page_id>.postwrite.fetch.txt`. Same rule as step 4.2 above: pass the raw string as `content`; no Bash heredoc / `echo`.
    5. `Bash`: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" process-postwrite .nsync/tmp/<page_id>.postwrite.fetch.txt --page-id <id> --snapshot-out .nsync/snapshots/<id>.md --delete-fetch`
    Returns `{page_id, new_remote_hash}` (a `CommitWriteResult` variant).
 

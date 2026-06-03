@@ -34,18 +34,18 @@ Once preflight passes:
 
 1. Capture parent metadata (UUID, title, URL).
 2. Create `.nsync/`:
-   - `config.json` — `{schema_version: 1, plugin_version: "0.3.0", parent: {page_id, url, title}, created_at: <RFC3339>}`
+   - `config.json` — `{schema_version: 1, plugin_version: "0.3.1", parent: {page_id, url, title}, created_at: <RFC3339>}`
    - `manifest.json` — initial shell `{schema_version, plugin_version, parent, pages: {}, trash_log: []}`. Sorted-key, two-space-indented.
    - `ignore` — copy "Default ignore patterns" block from `path-mapping.md` verbatim.
    - `snapshots/`, `tmp/` — empty directories.
 
-3. **Enumerate the sub-tree, round-by-round.** Save the parent fetch to `.nsync/tmp/<parent_id>.fetch.txt` (you already have its body cached from preflight step 5; write the response `text` field verbatim). Then loop:
+3. **Enumerate the sub-tree, round-by-round.** Save the parent fetch to `.nsync/tmp/<parent_id>.fetch.txt` using the `Write` tool (not Bash — see `notion-mcp-cheatsheet.md` → "Sub-agent fan-out & context discipline" and `references/sub-agent-body-escape-drift.md`). Pass the response's `.text` field as `content`. Then loop:
    ```sh
    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/nsync.py" enumerate-tree \
      --fetches-dir .nsync/tmp \
      > .nsync/tmp/frontier.json
    ```
-   Read `frontier.json`. If `done: true`, the tree is fully enumerated. Otherwise, dispatch a Workflow batch to fetch every UUID in `next_round`: each sub-agent does **one tool call** (notion-fetch) per page and one Write to `.nsync/tmp/<page_id>.fetch.txt`. After the batch lands, re-run `enumerate-tree` — it now sees more cached fetches and emits the next frontier. Report progress per `notion-mcp-cheatsheet.md` → "Progress reporting" each round (e.g. `Enumerating sub-tree… (87 pages so far)`). Hard cap at 500 pages.
+   Read `frontier.json`. If `done: true`, the tree is fully enumerated. Otherwise, dispatch a Workflow batch to fetch every UUID in `next_round`: each sub-agent does **one tool call** (notion-fetch) per page and one `Write`-tool call to `.nsync/tmp/<page_id>.fetch.txt`. **The `Write` MUST use the tool, not Bash heredoc / `echo`** — pass `.text` directly as `content`. After the batch lands, re-run `enumerate-tree` — it now sees more cached fetches and emits the next frontier. Report progress per `notion-mcp-cheatsheet.md` → "Progress reporting" each round (e.g. `Enumerating sub-tree… (87 pages so far)`). Hard cap at 500 pages.
 
 4. **Compute the path map.** Read each cached fetch envelope inline (via Read tool), extract title from the `<properties>` block and parent UUID from `<ancestor-path>`, then compute the full UUID→path map per `path-mapping.md` (slug + collision suffix + `index.md` for has_children). Path computation uses only titles + parentage — no body re-fetch needed. Persist the manifest with placeholder PageRecords (path, parent_page_id, title, url, has_children, empty hashes).
 
